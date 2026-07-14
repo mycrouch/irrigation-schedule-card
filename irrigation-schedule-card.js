@@ -1,22 +1,32 @@
 /**
- * Irrigation Schedule Card v0.1.0
+ * Irrigation Schedule Card v0.2.0
  * https://github.com/mycrouch/irrigation-schedule-card
  * ----------------------------------------------------------------
  * A Lovelace card for weekly irrigation scheduling with rain smarts.
  *
- *  - Per-zone weekly schedule: day-of-week chips (M T W T F S S),
- *    a start time and a run duration, plus an enable toggle per zone
- *    and a global enable. Editing writes to a native HA `schedule`
- *    helper per zone via the schedule WebSocket API.
- *  - Status strip: the next scheduled run (zone + day/time), the zone
- *    currently running with time remaining, and any active skip reason
- *    ("Skipped — 14 mm rain in last 48 h", "Rain delay until Thu 6:00").
+ *  - Per-zone scheduling, front and centre: every zone is a self-contained,
+ *    collapsible schedule editor. A collapsed row shows a plain-language
+ *    summary ("3× a week — Mon, Wed, Fri at 5:30 am for 15 min" / "Off");
+ *    tap to expand and set seven independent day chips (M T W T F S S),
+ *    a start time, a run duration and the zone's enable toggle. Different
+ *    zones on different days/times/durations is trivially obvious.
+ *    Editing writes to a native HA `schedule` helper per zone via the
+ *    schedule WebSocket API, and existing blocks are read back into the
+ *    chips/time/minutes. A schedule the simple model can't represent
+ *    (several different times in one day) is shown as a "Custom schedule"
+ *    and is never overwritten unless the user edits it.
+ *  - Plain-language rain status: the rain area reads as a sentence, e.g.
+ *    "No recent rain (0 mm in last 48 h) — schedules will run",
+ *    "14 mm in last 48 h — next runs will be skipped",
+ *    "Raining hard (6 mm/h) — active zones stopped".
  *  - Rain controls: 24 h / 48 h / 72 h rain-delay buttons + clear, and
  *    a "Skip next run" button.
- *  - GUI editor with one-click "Set up schedule helpers": creates the
- *    per-zone schedule + timer helpers, the control helpers, the daily
- *    rainfall utility meter + 48 h template sensor, and the dispatcher,
- *    rain-stop and safety automations — all server-side.
+ *  - Missing helpers are offered a one-tap "Create" (admin) instead of a
+ *    bare error, and the GUI editor's one-click "Set up schedule helpers"
+ *    is idempotent — re-running fills gaps and never duplicates. It creates
+ *    the per-zone schedule + timer + enable helpers, the control helpers,
+ *    the daily rainfall utility meter + 48 h template sensor, and the
+ *    dispatcher, rain-stop and safety automations — all server-side.
  *
  * Reliability model (all countdown / skip / stop logic lives in HA):
  *  - A dispatcher automation starts each zone's timer + switch when its
@@ -34,7 +44,7 @@
 
   const CARD_TAG = "irrigation-schedule-card";
   const EDITOR_TAG = "irrigation-schedule-card-editor";
-  const VERSION = "0.1.0";
+  const VERSION = "0.2.0";
 
   const MAX_ZONES = 8;
   const DEFAULT_MINUTES = 15;
@@ -96,6 +106,40 @@
 
   const minToTime = (m) => `${pad2(Math.floor(m / 60) % 24)}:${pad2(m % 60)}`;
 
+  // "05:30" / "17:00" -> "5:30 am" / "5:00 pm" (Australian English)
+  const fmt12 = (t) => {
+    const m = timeToMin(t);
+    if (m == null) return t || "";
+    const h24 = Math.floor(m / 60) % 24;
+    const mm = m % 60;
+    const ap = h24 < 12 ? "am" : "pm";
+    let h = h24 % 12;
+    if (h === 0) h = 12;
+    return `${h}:${pad2(mm)} ${ap}`;
+  };
+
+  // Turn an object_id back into a human name whose slug round-trips to it.
+  // "irrigation_skip_next_run" -> "Irrigation Skip Next Run"
+  const titleize = (objectId) =>
+    String(objectId || "")
+      .split(/[_\s]+/)
+      .filter(Boolean)
+      .map((w) => w.charAt(0).toUpperCase() + w.slice(1))
+      .join(" ");
+
+  // Ordered short day labels ("Mon, Wed, Fri") for a set of day indices.
+  const daysList = (daySet) =>
+    DAYS.filter((_, idx) => daySet.has(idx))
+      .map((d) => d.label)
+      .join(", ");
+
+  // slug used when deriving an expected object_id from a helper name.
+  const slugify = (text) =>
+    String(text)
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, "_")
+      .replace(/^_+|_+$/g, "");
+
   const fireEvent = (node, type, detail) =>
     node.dispatchEvent(
       new CustomEvent(type, { detail, bubbles: true, composed: true })
@@ -119,12 +163,14 @@
     constructor() {
       super();
       this.attachShadow({ mode: "open" });
-      this._schedules = {}; // schedule entity_id -> {days:Set, start, minutes, blocks}
+      this._schedules = {}; // schedule entity_id -> {days:Set, start, minutes, custom, summary}
       this._loadedSchedules = false;
       this._loadingSchedules = false;
       this._tick = null;
       this._stateKey = "";
       this._appliedThemeProps = [];
+      this._expanded = new Set(); // zone indices currently expanded
+      this._creating = new Set(); // entity ids mid-create
     }
 
     static getConfigElement() {
@@ -135,7 +181,7 @@
       return {
         title: "Irrigation Schedule",
         global_enable: "input_boolean.irrigation_schedule_enabled",
-        skip_next: "input_boolean.irrigation_skip_next",
+        skip_next: "input_boolean.irrigation_skip_next_run",
         rain_delay: "input_datetime.irrigation_rain_delay_until",
         zones: [],
       };
@@ -164,8 +210,15 @@
       const key = this._computeStateKey();
       if (key !== this._stateKey || !prev) {
         this._stateKey = key;
+        // Don't yank the DOM out from under an active edit (time input etc.).
+        const active = this.shadowRoot && this.shadowRoot.activeElement;
+        if (active && active.tagName === "INPUT") return;
         this._render();
       }
+    }
+
+    _isAdmin() {
+      return !!this._hass?.user?.is_admin;
     }
 
     getCardSize() {
@@ -241,25 +294,51 @@
       }
     }
 
-    // Reduce a schedule helper config to {days:Set, start, minutes}.
+    // Reduce a schedule helper config to {days:Set, start, minutes, custom}.
+    // A schedule the simple model can't represent — more than one block in a
+    // day, or different times on different days — is flagged `custom` so the
+    // card shows it faithfully and never flattens it on an unrelated re-render.
     _parseSchedule(cfg) {
-      const out = { days: new Set(), start: null, minutes: null };
+      const out = { days: new Set(), start: null, minutes: null, custom: false };
       if (!cfg) return out;
+      let firstFrom = null;
+      let firstTo = null;
       DAYS.forEach((d, idx) => {
         const blocks = cfg[d.key] || [];
-        if (blocks.length) {
-          out.days.add(idx);
-          if (out.start == null) {
-            const from = timeToMin(blocks[0].from);
-            const to = timeToMin(blocks[0].to);
-            if (from != null) out.start = minToTime(from);
-            if (from != null && to != null) {
-              out.minutes = Math.max(1, (to > from ? to : to + 1440) - from);
-            }
+        if (!blocks.length) return;
+        out.days.add(idx);
+        if (blocks.length > 1) out.custom = true;
+        const from = timeToMin(blocks[0].from);
+        const to = timeToMin(blocks[0].to);
+        if (out.start == null && from != null) {
+          out.start = minToTime(from);
+          firstFrom = from;
+          if (to != null) {
+            firstTo = to;
+            out.minutes = Math.max(1, (to > from ? to : to + 1440) - from);
           }
+        } else {
+          // subsequent day — must match the first block to stay "simple"
+          if (from !== firstFrom || to !== firstTo) out.custom = true;
         }
       });
+      if (out.custom) out.summary = this._customSummary(cfg);
       return out;
+    }
+
+    // Faithful plain-language description of an arbitrary schedule config.
+    _customSummary(cfg) {
+      const parts = [];
+      DAYS.forEach((d) => {
+        const blocks = cfg[d.key] || [];
+        blocks.forEach((b) => {
+          const f = timeToMin(b.from);
+          const t = timeToMin(b.to);
+          const mins = f != null && t != null ? Math.max(1, (t > f ? t : t + 1440) - f) : null;
+          parts.push(`${d.label} ${fmt12(b.from)}${mins != null ? ` (${mins} min)` : ""}`);
+        });
+      });
+      return parts.join(" · ");
     }
 
     _sched(zone) {
@@ -272,6 +351,8 @@
         days: cur.days || new Set(),
         start: cur.start || DEFAULT_START,
         minutes: cur.minutes || zone.default_minutes || DEFAULT_MINUTES,
+        custom: !!cur.custom,
+        summary: cur.summary || "",
       };
     }
 
@@ -352,6 +433,51 @@
         entity_id: c.rain_delay,
         datetime: val,
       });
+    }
+
+    _toggleExpand(idx) {
+      this._expanded.has(idx)
+        ? this._expanded.delete(idx)
+        : this._expanded.add(idx);
+      this._render();
+    }
+
+    // One-tap create for a configured helper that's missing from hass.states.
+    // Uses the same WebSocket config APIs as the editor's one-click setup, and
+    // names the helper so its object_id round-trips to the configured id — so
+    // the existing card config resolves it with no further edits. Admin only.
+    async _createMissing(entityId) {
+      if (!entityId || !this._hass || this._creating.has(entityId)) return;
+      const domain = entityId.split(".")[0];
+      const oid = objectId(entityId);
+      const name = titleize(oid);
+      const creatable = {
+        input_boolean: { type: "input_boolean/create", payload: { name, icon: "mdi:calendar-check" } },
+        input_datetime: {
+          type: "input_datetime/create",
+          payload: { name, has_date: true, has_time: true, icon: "mdi:weather-pouring" },
+        },
+        input_number: {
+          type: "input_number/create",
+          payload: { name, min: 0, max: 100, step: 0.5, initial: 0, mode: "box" },
+        },
+        timer: { type: "timer/create", payload: { name, icon: DEFAULT_ICON, restore: true } },
+        schedule: { type: "schedule/create", payload: { name, icon: "mdi:calendar-clock" } },
+      }[domain];
+      if (!creatable) return; // sensors etc. can't be created here
+      this._creating.add(entityId);
+      this._render();
+      try {
+        await this._hass.callWS({ type: creatable.type, ...creatable.payload });
+        // force schedules + state to re-read
+        this._loadedSchedules = false;
+        this._stateKey = "";
+      } catch (e) {
+        console.error(`${CARD_TAG}: create ${entityId} failed`, e);
+      } finally {
+        this._creating.delete(entityId);
+        this._render();
+      }
     }
 
     /* ------------------------------------------------ derived status */
@@ -442,13 +568,17 @@
       const st = this._hass?.states?.[zone.entity];
       const running = isOn(st);
       const enSt = zone.enable ? this._hass?.states?.[zone.enable] : null;
-      const enabled = zone.enable ? isOn(enSt) : true;
+      const enableMissing = !!zone.enable && !enSt;
+      // A missing enable helper counts as "enabled" so the schedule still
+      // shows; the missing helper is surfaced with a Create affordance.
+      const enabled = zone.enable && enSt ? isOn(enSt) : true;
       const info = {
         idx,
         zone,
         running,
         missing: !st,
         enabled,
+        enableMissing,
         name:
           zone.name ||
           st?.attributes?.friendly_name ||
@@ -472,6 +602,76 @@
         }
       }
       return info;
+    }
+
+    /* ------------------------------------------------ plain language */
+
+    // The rain area as a single sentence Gavin can read at a glance.
+    _rainStatus() {
+      const c = this._config;
+      const delayUntil = this._delayUntil();
+      const rate = c.rain_rate_sensor ? this._num(c.rain_rate_sensor, null) : null;
+      const rateThresh = this._rainStopThreshold();
+      const r48 = this._rain48();
+      const skip48 = this._skip48hThreshold();
+      const anyRunning = (c.zones || []).some((z) =>
+        isOn(this._hass.states[z.entity])
+      );
+      const stale = this._rainDataStale();
+      const mm = (v) => (v % 1 ? v.toFixed(1) : v.toFixed(0));
+
+      if (rate != null && rateThresh != null && rate >= rateThresh) {
+        return {
+          icon: "mdi:weather-pouring",
+          cls: "warn",
+          text: anyRunning
+            ? `Raining hard (${mm(rate)} mm/h) — active zones stopped.`
+            : `Raining hard (${mm(rate)} mm/h) — scheduled runs paused.`,
+        };
+      }
+      if (delayUntil) {
+        return {
+          icon: "mdi:weather-pouring",
+          cls: "warn",
+          text: `Rain delay until ${this._dayLabel(delayUntil)} — scheduled runs paused.`,
+        };
+      }
+      if (!c.rain_rate_sensor && !c.rain_48h_sensor) return null;
+      if (stale) {
+        return {
+          icon: "mdi:cloud-alert",
+          cls: "warn",
+          text: "Rain data unavailable or stale — schedules will run anyway (fail-safe).",
+        };
+      }
+      if (r48.value != null && skip48 != null && r48.value >= skip48) {
+        return {
+          icon: "mdi:weather-rainy",
+          cls: "warn",
+          text: `${mm(r48.value)} mm in last 48 h — next scheduled runs will be skipped.`,
+        };
+      }
+      const v = r48.value != null ? r48.value : 0;
+      return {
+        icon: "mdi:weather-partly-cloudy",
+        cls: "ok",
+        text: `No recent rain (${mm(v)} mm in last 48 h) — schedules will run.`,
+      };
+    }
+
+    // Plain-language one-line summary of a zone's schedule.
+    _zoneSummary(info, s) {
+      if (info.running) {
+        return info.remaining != null
+          ? `Running now · ${fmtClock(info.remaining)} left`
+          : "Running now";
+      }
+      if (info.enabled === false) return "Off";
+      if (s.custom) return `Custom schedule — ${s.summary}`;
+      if (!s.days.size) return "Not scheduled";
+      return `${s.days.size}× a week — ${daysList(s.days)} at ${fmt12(
+        s.start
+      )} for ${s.minutes} min`;
     }
 
     /* ------------------------------------------------ styling */
@@ -530,51 +730,43 @@
 
       this._applyStyle();
 
+      const admin = this._isAdmin();
       const globalSt = c.global_enable && this._hass.states[c.global_enable];
+      const globalMissing = !!c.global_enable && !globalSt;
       const globalOn = c.global_enable ? isOn(globalSt) : true;
+      const skipMissing = !!c.skip_next && !this._hass.states[c.skip_next];
       const skipNextOn = c.skip_next && isOn(this._hass.states[c.skip_next]);
       const delayUntil = this._delayUntil();
-      const rain48 = this._rain48();
-      const skip48Threshold = this._skip48hThreshold();
-      const rainSkipActive =
-        rain48.value != null && !rain48.stale && rain48.value >= skip48Threshold;
-      const dataStale = this._rainDataStale();
 
       const running = infos.find((i) => i.running);
       const next = this._nextRun(infos);
+      const rain = this._rainStatus();
 
-      // -------- status line
+      // -------- schedule-centric status line (rain reads as its own sentence)
       let statusIcon = "mdi:calendar-clock";
       let statusText;
       let statusClass = "";
       if (!globalOn) {
         statusIcon = "mdi:calendar-remove";
-        statusText = "Schedule disabled";
+        statusText = "Whole schedule is off";
         statusClass = "muted";
       } else if (running) {
         statusIcon = "mdi:water";
-        statusText = running.remaining != null
-          ? `${running.name} running · ${fmtClock(running.remaining)} left`
-          : `${running.name} running`;
+        statusText =
+          running.remaining != null
+            ? `${running.name} running · ${fmtClock(running.remaining)} left`
+            : `${running.name} running`;
         statusClass = "active";
-      } else if (delayUntil) {
-        statusIcon = "mdi:weather-pouring";
-        statusText = `Rain delay until ${this._dayLabel(delayUntil)}`;
-        statusClass = "warn";
-      } else if (rainSkipActive) {
-        statusIcon = "mdi:weather-rainy";
-        statusText = `Rain skip — ${rain48.value.toFixed(1)} mm in last 48 h`;
-        statusClass = "warn";
       } else if (skipNextOn) {
         statusIcon = "mdi:skip-next-circle-outline";
         statusText = "Next scheduled run will be skipped";
         statusClass = "warn";
       } else if (next) {
-        statusText = `Next: ${next.name} · ${this._dayLabel(next.when)}`;
+        statusText = `Next run: ${next.name} · ${this._dayLabel(next.when)}`;
       } else {
         statusIcon = "mdi:calendar-blank";
         statusText = zones.length
-          ? "No upcoming runs — pick days below"
+          ? "No upcoming runs — open a zone below and pick its days"
           : "No zones configured yet";
         statusClass = "muted";
       }
@@ -587,41 +779,33 @@
           <div class="header">
             <ha-icon class="header-icon" icon="mdi:sprinkler-variant"></ha-icon>
             <div class="title">${c.title || "Irrigation Schedule"}</div>
-            <button class="master ${globalOn ? "on" : ""}" id="global"
-              title="${globalOn ? "Schedule on" : "Schedule off"}">
-              <ha-icon icon="${globalOn ? "mdi:calendar-check" : "mdi:calendar-remove"}"></ha-icon>
-            </button>
+            ${
+              globalMissing
+                ? admin
+                  ? `<button class="pill-create" data-create="${c.global_enable}" title="Create the missing master switch helper">
+                       <ha-icon icon="mdi:plus"></ha-icon>Create
+                     </button>`
+                  : ""
+                : `<button class="master ${globalOn ? "on" : ""}" id="global"
+                     title="${globalOn ? "Schedule on" : "Schedule off"}">
+                     <ha-icon icon="${globalOn ? "mdi:calendar-check" : "mdi:calendar-remove"}"></ha-icon>
+                   </button>`
+            }
           </div>
-
-          ${
-            dataStale
-              ? `<div class="warning">
-                   <ha-icon icon="mdi:cloud-alert"></ha-icon>
-                   <span>Rain data unavailable or stale — schedule will run without rain checks.</span>
-                 </div>`
-              : ""
-          }
 
           <div class="status ${statusClass}">
             <ha-icon icon="${statusIcon}"></ha-icon>
             <span>${statusText}</span>
           </div>
 
-          <div class="rain-bar">
-            <span class="rain-label"><ha-icon icon="mdi:weather-pouring"></ha-icon>Rain delay</span>
-            <div class="rain-btns">
-              <button class="chip-btn ${delayUntil ? "" : ""}" data-delay="24">24 h</button>
-              <button class="chip-btn" data-delay="48">48 h</button>
-              <button class="chip-btn" data-delay="72">72 h</button>
-              <button class="chip-btn ghost" id="clear-delay" ${delayUntil ? "" : "disabled"}>Clear</button>
-            </div>
-          </div>
-          <div class="skip-row">
-            <button class="skip-btn ${skipNextOn ? "on" : ""}" id="skip-next">
-              <ha-icon icon="mdi:skip-next-circle-outline"></ha-icon>
-              ${skipNextOn ? "Skip armed — tap to cancel" : "Skip next run"}
-            </button>
-          </div>
+          ${
+            rain
+              ? `<div class="rain-status ${rain.cls}">
+                   <ha-icon icon="${rain.icon}"></ha-icon>
+                   <span>${rain.text}</span>
+                 </div>`
+              : ""
+          }
 
           <div class="zones">
             ${
@@ -631,10 +815,31 @@
             }
           </div>
 
-          <div class="foot">
-            ${rain48.missing ? "" : `<span>48 h rain: ${
-              rain48.value != null ? rain48.value.toFixed(1) + " mm" : "—"
-            } · skip ≥ ${skip48Threshold} mm</span>`}
+          <div class="controls">
+            <div class="rain-bar">
+              <span class="rain-label"><ha-icon icon="mdi:weather-pouring"></ha-icon>Rain delay</span>
+              <div class="rain-btns">
+                <button class="chip-btn" data-delay="24">24 h</button>
+                <button class="chip-btn" data-delay="48">48 h</button>
+                <button class="chip-btn" data-delay="72">72 h</button>
+                <button class="chip-btn ghost" id="clear-delay" ${delayUntil ? "" : "disabled"}>Clear</button>
+              </div>
+            </div>
+            <div class="skip-row">
+              ${
+                skipMissing
+                  ? admin
+                    ? `<button class="skip-btn create" data-create="${c.skip_next}">
+                         <ha-icon icon="mdi:plus-circle-outline"></ha-icon>
+                         Create “skip next run” helper
+                       </button>`
+                    : `<div class="mini-note"><ha-icon icon="mdi:alert-circle-outline"></ha-icon>“Skip next run” helper missing — ask an admin to run setup.</div>`
+                  : `<button class="skip-btn ${skipNextOn ? "on" : ""}" id="skip-next">
+                       <ha-icon icon="mdi:skip-next-circle-outline"></ha-icon>
+                       ${skipNextOn ? "Skip armed — tap to cancel" : "Skip next run"}
+                     </button>`
+              }
+            </div>
           </div>
         </ha-card>
       `;
@@ -644,64 +849,109 @@
 
     _zoneHtml(i) {
       const zone = i.zone;
+      const idx = i.idx;
+
+      // Zone switch/valve entity missing — can't auto-create a device entity.
       if (i.missing) {
         return `
           <div class="zone missing">
-            <ha-icon icon="mdi:alert-circle-outline"></ha-icon>
+            <div class="icon-wrap warn"><ha-icon icon="mdi:alert-circle-outline"></ha-icon></div>
             <div class="zinfo">
               <div class="zname">${i.name}</div>
-              <div class="zsub">Entity not found: ${zone.entity || "(none set)"}</div>
+              <div class="zsub">Zone entity not found: ${zone.entity || "(none set)"}</div>
             </div>
           </div>`;
       }
+
       const s = this._sched(zone);
+      const expanded = this._expanded.has(idx);
+      const summary = this._zoneSummary(i, s);
+      const admin = this._isAdmin();
+      const schedMissing = !!zone.schedule && !this._hass.states[zone.schedule];
+      const creatingSched = this._creating.has(zone.schedule);
+
+      // right-hand control in the header: enable toggle, or a Create for a
+      // missing enable helper.
+      let headCtl = "";
+      if (i.enableMissing) {
+        headCtl = admin
+          ? `<button class="pill-create" data-create="${zone.enable}" title="Create the missing enable helper">
+               <ha-icon icon="mdi:plus"></ha-icon>Create
+             </button>`
+          : "";
+      } else if (zone.enable) {
+        headCtl = `<button class="ztoggle ${i.enabled ? "on" : ""}" data-enable="${idx}"
+             title="${i.enabled ? "Zone schedule enabled" : "Zone schedule off"}">
+             <ha-icon icon="${i.enabled ? "mdi:toggle-switch" : "mdi:toggle-switch-off-outline"}"></ha-icon>
+           </button>`;
+      }
+
       const chips = DAYS.map(
-        (d, idx) =>
-          `<button class="day ${s.days.has(idx) ? "on" : ""}"
-             data-idx="${i.idx}" data-day="${idx}">${d.short}</button>`
+        (d, di) =>
+          `<button class="day ${s.days.has(di) ? "on" : ""}"
+             data-idx="${idx}" data-day="${di}">${d.short}</button>`
       ).join("");
 
-      const runBadge = i.running
-        ? `<span class="run-badge"><span class="dot"></span>${
-            i.remaining != null ? fmtClock(i.remaining) + " left" : "running"
-          }</span>`
-        : "";
+      // expanded editor body
+      let body = "";
+      if (expanded) {
+        if (schedMissing) {
+          body = `
+            <div class="zbody">
+              <div class="mini-note">
+                <ha-icon icon="mdi:calendar-alert"></ha-icon>
+                Schedule helper missing (${zone.schedule}).
+              </div>
+              ${
+                admin
+                  ? `<button class="mini-create" data-create="${zone.schedule}" ${creatingSched ? "disabled" : ""}>
+                       <ha-icon icon="mdi:plus-circle-outline"></ha-icon>
+                       ${creatingSched ? "Creating…" : "Create schedule helper"}
+                     </button>`
+                  : `<div class="mini-note sub">Ask an admin to run “Set up schedule helpers”.</div>`
+              }
+            </div>`;
+        } else {
+          body = `
+            <div class="zbody">
+              ${
+                s.custom
+                  ? `<div class="mini-note">
+                       <ha-icon icon="mdi:information-outline"></ha-icon>
+                       This zone has a custom schedule set outside the card. Editing the days or time below replaces it with a simple weekly one.
+                     </div>`
+                  : ""
+              }
+              <div class="days">${chips}</div>
+              <div class="zctl">
+                <label class="time">
+                  <ha-icon icon="mdi:clock-outline"></ha-icon>
+                  <input type="time" value="${s.start}" data-time="${idx}" />
+                </label>
+                <div class="stepper" data-idx="${idx}">
+                  <button class="step minus" data-idx="${idx}">−</button>
+                  <span class="mins">${s.minutes} min</span>
+                  <button class="step plus" data-idx="${idx}">+</button>
+                </div>
+              </div>
+            </div>`;
+        }
+      }
 
       return `
-        <div class="zone ${i.running ? "running" : ""} ${i.enabled ? "" : "disabled"}">
-          <div class="zhead">
+        <div class="zone ${i.running ? "running" : ""} ${i.enabled ? "" : "disabled"} ${expanded ? "expanded" : ""}">
+          <div class="zhead" data-expand="${idx}">
             <div class="icon-wrap ${i.running ? "active" : ""}">
               <ha-icon icon="${i.icon}"></ha-icon>
             </div>
             <div class="zinfo">
-              <div class="zname">${i.name} ${runBadge}</div>
-              <div class="zsub">${
-                s.days.size
-                  ? `${s.days.size} day${s.days.size > 1 ? "s" : ""} · ${s.start} · ${s.minutes} min`
-                  : "Not scheduled"
-              }</div>
+              <div class="zname">${i.name}</div>
+              <div class="zsub ${i.running ? "running" : ""} ${s.custom ? "custom" : ""}">${summary}</div>
             </div>
-            ${
-              zone.enable
-                ? `<button class="ztoggle ${i.enabled ? "on" : ""}" data-enable="${i.idx}"
-                     title="${i.enabled ? "Zone enabled" : "Zone disabled"}">
-                     <ha-icon icon="${i.enabled ? "mdi:toggle-switch" : "mdi:toggle-switch-off-outline"}"></ha-icon>
-                   </button>`
-                : ""
-            }
+            ${headCtl}
+            <ha-icon class="chevron" icon="${expanded ? "mdi:chevron-up" : "mdi:chevron-down"}"></ha-icon>
           </div>
-          <div class="days">${chips}</div>
-          <div class="zctl">
-            <label class="time">
-              <ha-icon icon="mdi:clock-outline"></ha-icon>
-              <input type="time" value="${s.start}" data-time="${i.idx}" />
-            </label>
-            <div class="stepper" data-idx="${i.idx}">
-              <button class="step minus" data-idx="${i.idx}">−</button>
-              <span class="mins">${s.minutes} min</span>
-              <button class="step plus" data-idx="${i.idx}">+</button>
-            </div>
-          </div>
+          ${body}
         </div>`;
     }
 
@@ -723,26 +973,46 @@
         this._clearDelay()
       );
 
+      // one-tap create for any missing helper
+      root.querySelectorAll("[data-create]").forEach((b) =>
+        b.addEventListener("click", (ev) => {
+          ev.stopPropagation();
+          this._createMissing(b.dataset.create);
+        })
+      );
+
+      // expand / collapse a zone (ignore taps on the enable toggle / create)
+      root.querySelectorAll("[data-expand]").forEach((el) =>
+        el.addEventListener("click", (ev) => {
+          if (ev.target.closest("[data-enable],[data-create]")) return;
+          this._toggleExpand(Number(el.dataset.expand));
+        })
+      );
+
       root.querySelectorAll(".day").forEach((b) =>
-        b.addEventListener("click", () => {
+        b.addEventListener("click", (ev) => {
+          ev.stopPropagation();
           const zone = this._config.zones[Number(b.dataset.idx)];
           this._toggleDay(zone, Number(b.dataset.day));
         })
       );
-      root.querySelectorAll("[data-time]").forEach((inp) =>
+      root.querySelectorAll("[data-time]").forEach((inp) => {
+        inp.addEventListener("click", (ev) => ev.stopPropagation());
         inp.addEventListener("change", () => {
           const zone = this._config.zones[Number(inp.dataset.time)];
           if (inp.value) this._setStart(zone, inp.value);
-        })
-      );
+        });
+      });
       root.querySelectorAll(".step").forEach((b) =>
-        b.addEventListener("click", () => {
+        b.addEventListener("click", (ev) => {
+          ev.stopPropagation();
           const zone = this._config.zones[Number(b.dataset.idx)];
           this._bumpMinutes(zone, b.classList.contains("plus") ? 1 : -1);
         })
       );
       root.querySelectorAll("[data-enable]").forEach((b) =>
-        b.addEventListener("click", () => {
+        b.addEventListener("click", (ev) => {
+          ev.stopPropagation();
           const zone = this._config.zones[Number(b.dataset.enable)];
           this._toggle(zone.enable);
         })
@@ -760,10 +1030,13 @@
     }
     :host(.style-manual) .title,
     :host(.style-manual) .zname,
-    :host(.style-manual) .status span { color: #fff; }
+    :host(.style-manual) .status span,
+    :host(.style-manual) .rain-status span { color: #fff; }
     :host(.style-manual) .zsub,
-    :host(.style-manual) .foot,
-    :host(.style-manual) .rain-label { color: rgba(255,255,255,0.75); }
+    :host(.style-manual) .rain-label,
+    :host(.style-manual) .chevron { color: rgba(255,255,255,0.75); }
+    :host(.style-manual) .zone { border-color: rgba(255,255,255,0.18); }
+    :host(.style-manual) .controls { border-top-color: rgba(255,255,255,0.18); }
     :host(.style-manual) .icon-wrap { background: rgba(255,255,255,0.14); color: #fff; }
     :host(.style-manual) .day,
     :host(.style-manual) .chip-btn,
@@ -789,14 +1062,29 @@
     .master.on { color: var(--primary-color); }
     .master:hover { background: rgba(var(--rgb-primary-color, 33,150,243), 0.12); }
 
-    .warning {
-      display: flex; align-items: center; gap: 8px;
-      margin: 0 16px 8px; padding: 8px 12px; border-radius: 10px;
-      background: rgba(255,152,0,0.14);
-      color: var(--warning-color, #ff9800);
-      font-size: 0.8rem;
+    .pill-create {
+      border: 1px solid var(--primary-color); border-radius: 999px;
+      background: transparent; color: var(--primary-color); cursor: pointer;
+      padding: 5px 10px; font-size: 0.75rem; font-weight: 600; flex-shrink: 0;
+      display: inline-flex; align-items: center; gap: 3px;
     }
-    .warning ha-icon { --mdc-icon-size: 20px; flex-shrink: 0; }
+    .pill-create ha-icon { --mdc-icon-size: 16px; }
+    .pill-create:hover { background: rgba(var(--rgb-primary-color, 33,150,243), 0.12); }
+
+    .rain-status {
+      display: flex; align-items: center; gap: 8px;
+      margin: 0 16px 10px; padding: 9px 12px; border-radius: 10px;
+      font-size: 0.85rem; font-weight: 500;
+    }
+    .rain-status ha-icon { --mdc-icon-size: 20px; flex-shrink: 0; }
+    .rain-status.ok {
+      background: rgba(76,175,80,0.12); color: var(--primary-text-color);
+    }
+    .rain-status.ok ha-icon { color: var(--success-color, #43a047); }
+    .rain-status.warn {
+      background: rgba(255,152,0,0.14); color: var(--primary-text-color);
+    }
+    .rain-status.warn ha-icon { color: var(--warning-color, #ff9800); }
 
     .status {
       display: flex; align-items: center; gap: 8px;
@@ -810,6 +1098,11 @@
     .status.warn ha-icon { color: var(--warning-color, #ff9800); }
     .status.muted { background: rgba(127,127,127,0.10); }
     .status.muted ha-icon { color: var(--secondary-text-color); }
+
+    .controls {
+      margin-top: 6px; padding-top: 10px;
+      border-top: 1px solid var(--divider-color);
+    }
 
     .rain-bar {
       display: flex; align-items: center; gap: 8px;
@@ -845,6 +1138,24 @@
       border-color: var(--warning-color, #ff9800);
       color: var(--warning-color, #ff9800);
     }
+    .skip-btn.create { border-style: dashed; color: var(--primary-color); }
+    .skip-btn ha-icon { --mdc-icon-size: 20px; }
+
+    .mini-note {
+      display: flex; align-items: flex-start; gap: 6px;
+      font-size: 0.78rem; color: var(--secondary-text-color);
+      padding: 2px 0 6px;
+    }
+    .mini-note ha-icon { --mdc-icon-size: 18px; flex-shrink: 0; color: var(--warning-color, #ff9800); }
+    .mini-note.sub { color: var(--secondary-text-color); }
+    .mini-create {
+      width: 100%; border: 1px dashed var(--primary-color); border-radius: 8px;
+      background: transparent; color: var(--primary-color); cursor: pointer;
+      padding: 8px; font-size: 0.8rem; font-weight: 600;
+      display: flex; align-items: center; justify-content: center; gap: 6px;
+    }
+    .mini-create:hover { background: rgba(var(--rgb-primary-color, 33,150,243), 0.08); }
+    .mini-create:disabled { opacity: 0.6; cursor: default; }
 
     .zones { padding: 2px 8px; }
     .empty {
@@ -853,14 +1164,22 @@
     }
 
     .zone {
-      border-radius: 12px; margin: 6px 4px; padding: 10px 10px 12px;
+      border-radius: 12px; margin: 6px 4px;
       border: 1px solid var(--divider-color);
+      transition: border-color 0.15s ease;
     }
     .zone.running { border-color: var(--primary-color); background: rgba(var(--rgb-primary-color, 33,150,243), 0.06); }
-    .zone.disabled { opacity: 0.55; }
-    .zone.missing { display: flex; align-items: center; gap: 10px; opacity: 0.7; }
+    .zone.disabled .icon-wrap { opacity: 0.55; }
+    .zone.disabled .zname { opacity: 0.7; }
+    .zone.expanded { border-color: var(--primary-color); }
+    .zone.missing { display: flex; align-items: center; gap: 10px; opacity: 0.7; padding: 10px; }
 
-    .zhead { display: flex; align-items: center; gap: 10px; }
+    .zhead {
+      display: flex; align-items: center; gap: 10px;
+      padding: 10px; cursor: pointer; border-radius: 12px;
+    }
+    .zhead:hover { background: rgba(var(--rgb-primary-color, 33,150,243), 0.04); }
+    .chevron { color: var(--secondary-text-color); --mdc-icon-size: 22px; flex-shrink: 0; }
     .icon-wrap {
       width: 36px; height: 36px; border-radius: 50%; flex-shrink: 0;
       display: flex; align-items: center; justify-content: center;
@@ -881,17 +1200,14 @@
       display: flex; align-items: center; gap: 8px;
       white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
     }
-    .zsub { font-size: 0.78rem; color: var(--secondary-text-color); }
-    .run-badge {
-      font-size: 0.72rem; font-weight: 600; color: var(--primary-color);
-      display: inline-flex; align-items: center; gap: 5px;
+    .zsub {
+      font-size: 0.78rem; color: var(--secondary-text-color);
+      white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
     }
-    .dot {
-      width: 7px; height: 7px; border-radius: 50%;
-      background: var(--primary-color); display: inline-block;
-      animation: blink 1.2s ease-in-out infinite;
-    }
-    @keyframes blink { 50% { opacity: 0.25; } }
+    .zsub.running { color: var(--primary-color); font-weight: 600; }
+    .zsub.custom { font-style: italic; }
+
+    .zbody { padding: 0 10px 12px; }
 
     .ztoggle {
       border: none; background: transparent; cursor: pointer;
@@ -940,12 +1256,6 @@
       min-width: 52px; text-align: center;
       font-size: 0.82rem; font-weight: 600; color: var(--primary-text-color);
     }
-
-    .foot {
-      padding: 4px 16px 6px; text-align: right;
-      font-size: 0.72rem; color: var(--secondary-text-color);
-    }
-    .foot:empty { display: none; }
   `;
 
   /* ========================================================== EDITOR */
@@ -1127,15 +1437,15 @@
         color_to: "Gradient to (hex)",
         device: "Irrigation device (optional — filters the zone entity pickers)",
         controls: "Control helpers",
-        rain: "Rain sensors & thresholds",
-        global_enable: "Global enable (input_boolean)",
+        rain: "Rain smarts",
+        global_enable: "Master schedule switch (input_boolean)",
         skip_next: "Skip-next-run (input_boolean)",
         rain_delay: "Rain delay until (input_datetime)",
-        rain_rate_sensor: "Live precipitation rate (mm/h) sensor",
-        rain_today_sensor: "Precipitation today (mm) sensor",
-        rain_48h_sensor: "48 h rainfall (mm) sensor",
-        rain_stop_number: "Rain-stop threshold (input_number, mm/h)",
-        skip_48h_number: "48 h skip threshold (input_number, mm)",
+        rain_rate_sensor: "Live rain-rate sensor (mm/h)",
+        rain_today_sensor: "Rain-today sensor (mm)",
+        rain_48h_sensor: "48 h rainfall sensor (mm)",
+        rain_stop_number: "Rain-stop threshold (mm/h)",
+        skip_48h_number: "48 h skip threshold (mm)",
         entity: "Zone entity (switch / valve)",
         schedule: "Schedule helper (created by Set up helpers)",
         timer: "Timer helper (created by Set up helpers)",
@@ -1144,6 +1454,37 @@
         icon: "Icon",
         default_minutes: "Default run duration",
       }[schema.name] || schema.name);
+
+    // Inline explanations shown under each field, with live current readings
+    // from the configured sensors so Gavin can sanity-check the thresholds.
+    _helper = (schema) => {
+      const c = this._config;
+      const reading = (id, unit) => {
+        if (!id) return "no sensor configured";
+        const s = this._hass?.states?.[id];
+        if (!s || ["unknown", "unavailable", ""].includes(s.state))
+          return `no reading from ${id}`;
+        return `${s.state}${unit ? " " + unit : ""} from ${id}`;
+      };
+      return {
+        global_enable:
+          "Master on/off for the whole programme. When off, no zone runs on schedule.",
+        skip_next:
+          "When armed, the next scheduled run is skipped once, then it clears itself.",
+        rain_delay:
+          "Holds a “don’t water until” time — set by the rain-delay buttons on the card face.",
+        rain_rate_sensor:
+          `Live rain intensity. A running zone is stopped when this stays above the rain-stop threshold. Current reading: ${reading(c.rain_rate_sensor, "mm/h")}.`,
+        rain_today_sensor:
+          `Rain so far today — the source for the rolling 48-hour total. Current reading: ${reading(c.rain_today_sensor, "mm")}.`,
+        rain_48h_sensor:
+          `Rain over the last two days. A scheduled run is skipped when this is at or above the 48 h threshold. Current reading: ${reading(c.rain_48h_sensor, "mm")}.`,
+        rain_stop_number:
+          `Stop watering when rain is heavier than this (mm/h). Current reading: ${reading(c.rain_rate_sensor, "mm/h")}.`,
+        skip_48h_number:
+          `Skip a scheduled run when more than this much rain (mm) fell over the last two days. Currently: ${reading(c.rain_48h_sensor, "mm")}.`,
+      }[schema.name];
+    };
 
     _fire() {
       fireEvent(this, "config-changed", { config: this._config });
@@ -1163,6 +1504,20 @@
       if (existsEntity && this._hass.states[existsEntity]) return existsEntity;
       const resp = await this._hass.callWS({ type: `${type}/create`, ...payload });
       return `${type}.${resp.id}`;
+    }
+
+    // Idempotent helper create. Returns the existing entity when the config
+    // already points at one, OR when a helper whose name slug matches already
+    // exists (so a re-run with a reset config reuses it instead of creating a
+    // duplicate), otherwise creates it. `name` is chosen so its slug is the
+    // stable object_id.
+    async _ensureHelper(domain, currentId, name, extra = {}) {
+      const hass = this._hass;
+      if (currentId && hass.states[currentId]) return currentId;
+      const expected = `${domain}.${this._slug(name)}`;
+      if (hass.states[expected]) return expected;
+      const r = await hass.callWS({ type: `${domain}/create`, name, ...extra });
+      return `${domain}.${r.id}`;
     }
 
     async _flowCreate(handler, steps) {
@@ -1198,54 +1553,34 @@
       try {
         const newZones = [...this._config.zones];
 
-        // 1. per-zone schedule, timer and enable helpers
+        // 1. per-zone schedule, timer and enable helpers (idempotent)
         say("Creating schedule / timer / enable helpers…");
         for (let i = 0; i < newZones.length; i++) {
           const z = newZones[i];
           if (!z?.entity) continue;
           const base = z.name || hass.states[z.entity]?.attributes?.friendly_name || `Zone ${i + 1}`;
           const patch = { ...z };
-          if (!(z.schedule && hass.states[z.schedule])) {
-            const r = await hass.callWS({ type: "schedule/create", name: `Irrigation ${base} Schedule`, icon: "mdi:calendar-clock" });
-            patch.schedule = `schedule.${r.id}`;
-          }
-          if (!(z.timer && hass.states[z.timer])) {
-            const r = await hass.callWS({ type: "timer/create", name: `Irrigation ${base}`, icon: DEFAULT_ICON, restore: true });
-            patch.timer = `timer.${r.id}`;
-          }
-          if (!(z.enable && hass.states[z.enable])) {
-            const r = await hass.callWS({ type: "input_boolean/create", name: `Irrigation ${base} Scheduled`, icon: "mdi:calendar-check" });
-            patch.enable = `input_boolean.${r.id}`;
-          }
+          patch.schedule = await this._ensureHelper("schedule", z.schedule, `Irrigation ${base} Schedule`, { icon: "mdi:calendar-clock" });
+          patch.timer = await this._ensureHelper("timer", z.timer, `Irrigation ${base}`, { icon: DEFAULT_ICON, restore: true });
+          patch.enable = await this._ensureHelper("input_boolean", z.enable, `Irrigation ${base} Scheduled`, { icon: "mdi:calendar-check" });
           if (!patch.default_minutes) patch.default_minutes = DEFAULT_MINUTES;
           newZones[i] = patch;
         }
 
-        // 2. global control helpers
+        // 2. global control helpers (idempotent)
         say("Creating control helpers…");
         const cfg = { ...this._config };
-        if (!(cfg.global_enable && hass.states[cfg.global_enable])) {
-          const r = await hass.callWS({ type: "input_boolean/create", name: "Irrigation Schedule Enabled", icon: "mdi:calendar-check" });
-          cfg.global_enable = `input_boolean.${r.id}`;
-        }
-        if (!(cfg.skip_next && hass.states[cfg.skip_next])) {
-          const r = await hass.callWS({ type: "input_boolean/create", name: "Irrigation Skip Next Run", icon: "mdi:skip-next-circle-outline" });
-          cfg.skip_next = `input_boolean.${r.id}`;
-        }
-        if (!(cfg.rain_delay && hass.states[cfg.rain_delay])) {
-          const r = await hass.callWS({ type: "input_datetime/create", name: "Irrigation Rain Delay Until", has_date: true, has_time: true, icon: "mdi:weather-pouring" });
-          cfg.rain_delay = `input_datetime.${r.id}`;
-        }
-        if (!(cfg.rain_stop_number && hass.states[cfg.rain_stop_number])) {
-          const r = await hass.callWS({ type: "input_number/create", name: "Irrigation Rain Stop Rate", min: 0, max: 50, step: 0.5, initial: DEFAULT_RAIN_STOP, unit_of_measurement: "mm/h", mode: "box", icon: "mdi:weather-pouring" });
-          cfg.rain_stop_number = `input_number.${r.id}`;
-        }
-        if (!(cfg.skip_48h_number && hass.states[cfg.skip_48h_number])) {
-          const r = await hass.callWS({ type: "input_number/create", name: "Irrigation Skip Rain 48h", min: 0, max: 100, step: 1, initial: DEFAULT_SKIP_48H, unit_of_measurement: "mm", mode: "box", icon: "mdi:weather-rainy" });
-          cfg.skip_48h_number = `input_number.${r.id}`;
-        }
+        cfg.global_enable = await this._ensureHelper("input_boolean", cfg.global_enable, "Irrigation Schedule Enabled", { icon: "mdi:calendar-check" });
+        cfg.skip_next = await this._ensureHelper("input_boolean", cfg.skip_next, "Irrigation Skip Next Run", { icon: "mdi:skip-next-circle-outline" });
+        cfg.rain_delay = await this._ensureHelper("input_datetime", cfg.rain_delay, "Irrigation Rain Delay Until", { has_date: true, has_time: true, icon: "mdi:weather-pouring" });
+        cfg.rain_stop_number = await this._ensureHelper("input_number", cfg.rain_stop_number, "Irrigation Rain Stop Rate", { min: 0, max: 50, step: 0.5, initial: DEFAULT_RAIN_STOP, unit_of_measurement: "mm/h", mode: "box", icon: "mdi:weather-pouring" });
+        cfg.skip_48h_number = await this._ensureHelper("input_number", cfg.skip_48h_number, "Irrigation Skip Rain 48h", { min: 0, max: 100, step: 1, initial: DEFAULT_SKIP_48H, unit_of_measurement: "mm", mode: "box", icon: "mdi:weather-rainy" });
 
-        // 3. rain measure: daily utility_meter + 48 h template sensor (best effort)
+        // 3. rain measure: daily utility_meter + 48 h template sensor (best
+        // effort, idempotent — skip when the 48 h sensor already exists)
+        if (hass.states["sensor.irrigation_rain_48h"] && !cfg.rain_48h_sensor) {
+          cfg.rain_48h_sensor = "sensor.irrigation_rain_48h";
+        }
         if (cfg.rain_today_sensor && !cfg.rain_48h_sensor) {
           say("Creating rain utility meter + 48 h sensor…");
           try {
@@ -1465,6 +1800,7 @@
       top.schema = this._topSchema();
       top.data = this._topData();
       top.computeLabel = this._label;
+      top.computeHelper = this._helper;
       top.addEventListener("value-changed", (ev) => {
         ev.stopPropagation();
         const v = { ...ev.detail.value, ...(ev.detail.value.controls || {}), ...(ev.detail.value.rain || {}) };
@@ -1545,7 +1881,7 @@
     type: CARD_TAG,
     name: "Irrigation Schedule Card",
     description:
-      "Weekly irrigation scheduler with rain smarts — per-zone day/time/duration, rain-delay and skip controls, and one-click server-side setup.",
+      "Per-zone weekly irrigation scheduler with rain smarts — each zone its own collapsible day/time/duration editor, plain-language rain status, rain-delay and skip controls, and one-click server-side setup.",
     preview: true,
     documentationURL: "https://github.com/mycrouch/irrigation-schedule-card",
   });

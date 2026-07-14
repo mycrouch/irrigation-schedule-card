@@ -5,20 +5,21 @@ A Lovelace card for **weekly irrigation scheduling with rain smarts**. Give each
 It is the companion to [manual-irrigation-zone-card](https://github.com/mycrouch/manual-irrigation-zone-card): the manual card handles ad-hoc runs, this one handles the weekly programme. Both share the same timers and safety automations, so manual and scheduled runs use one reliability model.
 
 <p align="center">
-  <img src="images/wide.png" alt="Irrigation Schedule Card — wide layout with a populated schedule" width="540">
+  <img src="images/wide.png" alt="Irrigation Schedule Card — each zone its own collapsible schedule, one expanded to show day chips, with a plain-language rain status" width="540">
   &nbsp;
-  <img src="images/narrow.png" alt="Irrigation Schedule Card — narrow layout showing an active rain skip" width="300">
+  <img src="images/narrow.png" alt="Irrigation Schedule Card — narrow layout with per-zone summaries and a running zone" width="300">
 </p>
 
 ## Features
 
-- **Per-zone weekly schedule.** Day-of-week chips (M T W T F S S), a start time and a run duration for each of up to 8 zones, plus an enable toggle per zone and a global enable. Editing writes straight to a native `schedule` helper via the schedule WebSocket API — the block length is the run duration.
-- **Rain intelligence.** A live precipitation-rate sensor stops watering mid-run when it rains hard; a rolling 48-hour rainfall figure skips a scheduled run when the ground is already wet.
+- **Per-zone scheduling, made obvious.** Every zone is its own self-contained, collapsible schedule editor. A collapsed row reads in plain language — *"3× a week — Mon, Wed, Fri at 5:30 am for 15 min"*, *"1× a week — Sun at 6:00 am for 20 min"*, or *"Off"* — so different zones on different days, times and durations are trivially obvious at a glance. Tap a row to expand it and set seven independent day chips (M T W T F S S), a start time, a run duration and the zone's enable toggle. Zone 1 can run three times a week while Zone 2 runs once — each keeps its own programme.
+- **Reads schedules back, never destroys them.** Editing writes straight to a native `schedule` helper via the schedule WebSocket API, and existing blocks are read back into the chips, time and minutes. A schedule the simple weekly model can't represent (several different times in one day) is shown faithfully as a **Custom schedule** and is left untouched unless you deliberately edit it.
+- **Plain-language rain status.** The rain area reads as a sentence, not raw entities — *"No recent rain (0 mm in last 48 h) — schedules will run"*, *"14 mm in last 48 h — next scheduled runs will be skipped"*, or *"Raining hard (6 mm/h) — active zones stopped"*.
 - **Rain-delay and skip controls.** One-tap 24 h / 48 h / 72 h rain delays with a clear button, plus a "Skip next run" button that self-clears after one cycle.
-- **Clear status strip.** Shows the next scheduled run (zone + day/time), the zone currently running with time remaining, and the active skip reason when one applies — *"Rain delay until Thu 6:00"*, *"Rain skip — 14.0 mm in last 48 h"*.
-- **Fail-safe by design.** If the rain data is missing or stale, the schedule **runs anyway** and the card shows a warning — watering is never silently skipped.
+- **Fail-safe by design.** If the rain data is missing or stale, the schedule **runs anyway** and the card says so — watering is never silently skipped.
+- **Missing helpers? One-tap Create.** If a configured helper is missing, an admin gets a **Create** button right where the control would be, instead of a bare error. The one-click setup is idempotent — re-running fills gaps and never creates duplicates.
 - **One-click server-side setup.** The GUI editor creates every helper and automation it needs (schedule + timer + enable per zone, the control helpers, the daily rainfall utility meter + 48 h template sensor, and the dispatcher / rain-stop / safety automations). No YAML editing required.
-- **GUI editor** with a device picker to filter the zone entity pickers, rain-sensor and threshold pickers, and a per-card style option (default / theme / manual gradient).
+- **Guided editor.** A device picker filters the zone entity pickers, and the **Rain smarts** section explains every field in plain English with the current live reading inline, so you can sanity-check each threshold. Per-card style option (default / theme / manual gradient).
 
 ## How it works
 
@@ -29,6 +30,16 @@ The card never runs a timer in the browser. Setup creates:
 3. **A rain-stop automation** — if the live precipitation rate stays above the rain-stop threshold for 5 minutes while any zone is on, it turns every zone off and cancels the timers.
 4. **Shared safety automations** — turn a zone off when its timer ends, and cancel a zone's timer if the zone is switched off elsewhere. These are shared with `manual-irrigation-zone-card`.
 5. **A daily rainfall utility meter + a 48 h template sensor** — the utility meter tracks today's rain from your "precipitation today" sensor; the template sensor sums today + yesterday for the rolling 48 h figure used by the skip logic.
+
+## How the rain smarts work
+
+The card watches the weather so it doesn't water a wet garden, using **two independent thresholds** plus a manual delay. You set both thresholds in the editor's **Rain smarts** section, where each field shows its current live reading so you can sanity-check it.
+
+- **Rain-stop rate (mm/h) — "it's raining right now".** A live precipitation-rate sensor. If the rate stays above this threshold for a few minutes while a zone is running, every active zone is turned off and its timer cancelled. This is the *"Raining hard (6 mm/h) — active zones stopped"* case. Default 4 mm/h.
+- **48 h skip amount (mm) — "the ground is already wet".** A rolling total of the rain over the last two days. When a scheduled run is due, if this total is at or above the threshold the run is skipped — no point watering soaked ground. This is the *"14 mm in last 48 h — next scheduled runs will be skipped"* case. Default 10 mm.
+- **Rain delay — "hold off for a bit".** The 24 h / 48 h / 72 h buttons on the card set a "don't water until" time; scheduled runs are paused until then, and **Clear** cancels it. Shown as *"Rain delay until Thu 6:00 am — scheduled runs paused"*.
+
+**Fail-safe:** the rain checks can only ever *skip* a run — they can never be the reason a run happens. If the weather data is **missing, unavailable or stale** (older than a few hours — common with cloud-sourced sensors), the card does **not** guess. The schedule **runs as normal** and the card shows *"Rain data unavailable or stale — schedules will run anyway (fail-safe)"*. A dry garden is a worse outcome than an occasional unnecessary watering, so when in doubt it waters.
 
 ## Installation
 
@@ -60,7 +71,7 @@ type: custom:irrigation-schedule-card
 title: Holman Watering System
 style: default
 global_enable: input_boolean.irrigation_schedule_enabled
-skip_next: input_boolean.irrigation_skip_next
+skip_next: input_boolean.irrigation_skip_next_run
 rain_delay: input_datetime.irrigation_rain_delay_until
 rain_rate_sensor: sensor.ibrisb3665_precipitation_rate
 rain_today_sensor: sensor.ibrisb3665_precipitation_today
