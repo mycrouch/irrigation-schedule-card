@@ -1,5 +1,5 @@
 /**
- * Irrigation Schedule Card v0.3.0
+ * Irrigation Schedule Card v0.3.1
  * https://github.com/mycrouch/irrigation-schedule-card
  * ----------------------------------------------------------------
  * A Lovelace card for weekly irrigation scheduling with rain smarts.
@@ -14,11 +14,16 @@
  *    ("Mon, Wed, Fri at 5:30 am for 10 min"), an enable toggle each, and
  *    tap-to-expand day/time/duration editors. Rain sentence, rain delay,
  *    skip-next and the global master switch are unchanged.
- *  - The editor is two steps: first "Zones in your system" (a zone count and
- *    each zone's physical switch/valve, with a one-click "Set up helpers" that
- *    creates the per-zone timer / schedule / enable helpers and the control
- *    helpers + automations); then a "Schedules" list you add to and delete
- *    from, each schedule bound to one of the defined zones.
+ *  - The editor leads with schedules (v0.3.1): directly under the basics a
+ *    "Schedules" list is the primary call-to-action ("+ Add schedule"), each
+ *    schedule bound to one of the defined zones. Zone setup is a compact,
+ *    collapsed "Zones in your system" expander below (like Control helpers and
+ *    Rain smarts): a zone-count number that generates exactly N compact zone
+ *    rows (entity + optional name + icon, with the schedule/timer/enable helper
+ *    pickers tucked under a per-zone "Advanced" expander), and a one-click
+ *    "Set up helpers" that creates the per-zone timer / schedule / enable
+ *    helpers plus the control helpers + automations and auto-fills the Advanced
+ *    pickers so they are never shown empty in the normal flow.
  *
  * Server-side design:
  *  - Each physical zone keeps exactly ONE native HA `schedule` helper
@@ -56,7 +61,7 @@
 
   const CARD_TAG = "irrigation-schedule-card";
   const EDITOR_TAG = "irrigation-schedule-card-editor";
-  const VERSION = "0.3.0";
+  const VERSION = "0.3.1";
 
   const MAX_ZONES = 8;
   const MAX_SCHEDULES = 24;
@@ -1042,9 +1047,12 @@
         statusText = `Next run: ${next.name} · ${this._dayLabel(next.when)}`;
       } else {
         statusIcon = "mdi:calendar-blank";
+        const hasZones = (c.zones || []).some((z) => z?.entity);
         statusText = schedules.length
           ? "No upcoming runs — open a schedule below and pick its days"
-          : "No schedules yet — add one in the card editor";
+          : hasZones
+          ? "No schedules yet — add a schedule in the card editor"
+          : "No zones set up yet — open the card editor to define your zones";
         statusClass = "muted";
       }
 
@@ -1088,7 +1096,9 @@
             ${
               schedules.length
                 ? infos.map((i) => this._scheduleHtml(i)).join("")
-                : `<div class="empty">No schedules yet — open the card editor, define your zones and add a schedule for each watering you want.</div>`
+                : (c.zones || []).some((z) => z?.entity)
+                ? `<div class="empty">No schedules yet — add a schedule in the card editor for each watering you want.</div>`
+                : `<div class="empty">No zones set up yet — open the card editor, define your zones, then add a schedule for each watering you want.</div>`
             }
           </div>
 
@@ -1563,8 +1573,10 @@
       const top = this.shadowRoot.getElementById("top");
       if (top) top.data = this._topData();
       this.shadowRoot
-        .querySelectorAll("#zones ha-form")
-        .forEach((f, i) => (f.data = this._config.zones[i] || {}));
+        .querySelectorAll("#zones ha-form.zone-form")
+        .forEach((f, i) => (f.data = this._zoneData(this._config.zones[i] || {}, i)));
+      const zc = this.shadowRoot.getElementById("zone-count");
+      if (zc) zc.data = { zone_count: this._config.zones.length };
       this.shadowRoot
         .querySelectorAll("#schedules ha-form")
         .forEach((f, i) => (f.data = this._scheduleData(this._config.schedules[i] || {})));
@@ -1682,12 +1694,74 @@
             ? { entity: { include_entities: include } }
             : { entity: { domain: ["switch", "valve", "light", "input_boolean"] } },
         },
-        { name: "name", selector: { text: {} } },
-        { name: "icon", selector: { icon: {} } },
-        { name: "schedule", selector: { entity: { domain: "schedule" } } },
-        { name: "timer", selector: { entity: { domain: "timer" } } },
-        { name: "enable", selector: { entity: { domain: "input_boolean" } } },
+        {
+          name: "details",
+          type: "grid",
+          schema: [
+            { name: "name", selector: { text: {} } },
+            { name: "icon", selector: { icon: {} } },
+          ],
+        },
+        {
+          // Helper overrides — auto-filled by "Set up helpers", hidden by
+          // default. Users never touch these in the normal flow.
+          name: "advanced",
+          type: "expandable",
+          flatten: true,
+          expanded: false,
+          schema: [
+            { name: "schedule", selector: { entity: { domain: "schedule" } } },
+            { name: "timer", selector: { entity: { domain: "timer" } } },
+            { name: "enable", selector: { entity: { domain: "input_boolean" } } },
+          ],
+        },
       ];
+    }
+
+    _zoneCountSchema() {
+      return [
+        {
+          name: "zone_count",
+          selector: { number: { min: 0, max: MAX_ZONES, step: 1, mode: "box" } },
+        },
+      ];
+    }
+
+    // Idempotent lookup: the entity IDs "Set up helpers" would create for a
+    // zone whose display base is `base`. Used to auto-fill the Advanced helper
+    // pickers so they are never shown empty once helpers exist.
+    _guessZoneHelpers(base) {
+      const s = this._slug(`Irrigation ${base}`);
+      const has = (id) => !!this._hass?.states?.[id];
+      const pick = (id) => (has(id) ? id : undefined);
+      return {
+        schedule: pick(`schedule.${this._slug(`Irrigation ${base} Schedule`)}`),
+        timer: pick(`timer.${s}`),
+        enable: pick(`input_boolean.${this._slug(`Irrigation ${base} Scheduled`)}`),
+      };
+    }
+
+    // A zone's display base (matches the naming used by _setupHelpers).
+    _zoneBase(z, i) {
+      return (
+        z.name ||
+        this._hass?.states?.[z.entity]?.attributes?.friendly_name ||
+        `Zone ${i + 1}`
+      );
+    }
+
+    // Zone data for its ha-form: fill the Advanced helper pickers from config,
+    // falling back to an idempotent name-slug lookup so they're never empty
+    // once helpers exist.
+    _zoneData(z, i) {
+      const out = { ...z };
+      if (z?.entity && (!out.schedule || !out.timer || !out.enable)) {
+        const g = this._guessZoneHelpers(this._zoneBase(z, i));
+        if (!out.schedule && g.schedule) out.schedule = g.schedule;
+        if (!out.timer && g.timer) out.timer = g.timer;
+        if (!out.enable && g.enable) out.enable = g.enable;
+      }
+      return out;
     }
 
     // Options for the schedule's zone picker: one per defined zone.
@@ -1777,11 +1851,13 @@
         rain_stop_number: "Rain-stop threshold (mm/h)",
         skip_48h_number: "48 h skip threshold (mm)",
         entity: "Zone switch / valve entity",
+        advanced: "Advanced — helper overrides (auto-filled)",
         schedule: "Schedule helper (created by Set up helpers)",
         timer: "Timer helper (created by Set up helpers)",
         enable: "Zone enable (input_boolean, created by Set up helpers)",
-        name: "Display name",
-        icon: "Icon",
+        name: "Display name (optional)",
+        icon: "Icon (optional)",
+        zone_count: "How many zones does your system have?",
         zone: "Zone",
         days: "Days",
         start: "Start time",
@@ -1818,6 +1894,10 @@
         skip_48h_number:
           `Skip a scheduled run when more than this much rain (mm) fell over the last two days. Currently: ${reading(c.rain_48h_sensor, "mm")}.`,
         zone: "The physical zone this schedule waters. The same zone can appear in several schedules (e.g. a short weekday run and a long weekend soak).",
+        zone_count:
+          "Set this to the number of physical valves/switches in your system — a row appears for each. “Set up helpers” then creates the timer/schedule/enable helpers for every zone.",
+        advanced:
+          "Filled in automatically by “Set up helpers”. Only open this if you want to point a zone at existing helpers instead.",
       }[schema.name];
     };
 
@@ -1965,7 +2045,7 @@
 
         this._config = { ...cfg, zones: newZones, schedules };
         this._fire();
-        say("Done — helpers and automations created. Add or edit schedules above, then enable the ones you want.");
+        say("Done — helpers and automations created, and each zone's Advanced fields filled in. Add or edit schedules in the Schedules section above, then enable the ones you want.");
         this._render();
       } catch (err) {
         console.error(`${CARD_TAG} setup failed`, err);
@@ -2122,48 +2202,54 @@
           .box { border: 1px solid var(--divider-color); border-radius: 10px; padding: 12px; }
           .box-head { display: flex; align-items: center; margin-bottom: 8px; }
           .box-head span { flex: 1; font-weight: 600; font-size: 0.9rem; color: var(--primary-text-color); }
+          .zone-row { display: flex; align-items: baseline; gap: 8px; }
+          .zone-row .zone-num { font-size: 0.8rem; font-weight: 600; color: var(--secondary-text-color); min-width: 3.6em; padding-top: 6px; }
+          .zone-row ha-form { flex: 1; }
           .del { border: none; background: transparent; cursor: pointer; color: var(--secondary-text-color); padding: 4px; }
           .del:hover { color: var(--error-color, #db4437); }
           .add, .setup { border: 1px dashed var(--divider-color); border-radius: 10px; background: transparent; padding: 12px; cursor: pointer; color: var(--primary-color); font-weight: 600; font-size: 0.9rem; width: 100%; }
+          .add.primary { border-style: solid; border-color: var(--primary-color); }
           .add:hover, .setup:hover { background: rgba(var(--rgb-primary-color, 33,150,243), 0.06); }
           .add:disabled { opacity: 0.5; cursor: default; }
-          .setup { border-style: solid; }
+          .setup { border-style: solid; margin-top: 4px; }
           .setup.ready { border-color: var(--primary-color); }
           .hint { font-size: 0.8rem; color: var(--secondary-text-color); }
           .status { font-size: 0.8rem; color: var(--primary-color); min-height: 1em; }
+          ha-expansion-panel { --expansion-panel-summary-padding: 0 8px; border: 1px solid var(--divider-color); border-radius: 10px; }
+          .panel-body { display: flex; flex-direction: column; gap: 12px; padding: 4px 8px 12px; }
         </style>
         <div class="wrap">
           <ha-form id="top"></ha-form>
-
-          <div class="section-title">Zones in your system</div>
-          <div class="section-sub">List each physical valve/switch once. “Set up helpers” makes the timer, schedule and enable helpers for them.</div>
-          <div id="zones"></div>
-          ${
-            zones.length < MAX_ZONES
-              ? `<button class="add" id="add-zone">＋ Add zone (${zones.length}/${MAX_ZONES})</button>`
-              : `<div class="hint">Maximum of ${MAX_ZONES} zones reached.</div>`
-          }
-          <button class="setup ${zonesNeedingSetup ? "ready" : ""}" id="setup">
-            ⚙ Set up helpers${zonesNeedingSetup ? ` (${zonesNeedingSetup} zone${zonesNeedingSetup === 1 ? "" : "s"} need helpers)` : " — re-run to update"}
-          </button>
-          <div class="status" id="setup-status"></div>
 
           <div class="section-title">Schedules</div>
           <div class="section-sub">Each schedule is one watering: a name, a zone, its days, a start time and a duration. Add as many as you like — the same zone can appear in several.</div>
           <div id="schedules"></div>
           ${
             hasZone
-              ? `<button class="add" id="add-schedule" ${schedules.length >= MAX_SCHEDULES ? "disabled" : ""}>＋ Add schedule${schedules.length >= MAX_SCHEDULES ? " (max reached)" : ""}</button>`
-              : `<div class="hint">Add a zone above first, then you can create schedules for it.</div>`
+              ? `<button class="add primary" id="add-schedule" ${schedules.length >= MAX_SCHEDULES ? "disabled" : ""}>＋ Add schedule${schedules.length >= MAX_SCHEDULES ? " (max reached)" : ""}</button>`
+              : `<button class="add" id="add-schedule" disabled>＋ Add schedule</button>
+                 <div class="hint">Define your zones first — open “Zones in your system” below.</div>`
           }
 
-          <div class="hint">
-            “Set up helpers” creates one schedule / timer / enable helper per zone, the control
-            helpers (global enable, skip-next, rain delay, thresholds), a daily rainfall utility
-            meter + 48 h template sensor, and the dispatcher / rain-stop / safety automations — all
-            server-side (admin required). Editing a schedule’s days, time or duration regenerates
-            that zone’s helper from all its enabled schedules.
-          </div>
+          <ha-expansion-panel id="zones-panel" ${hasZone ? "" : "expanded"} outlined>
+            <div slot="header">Zones in your system${zonesNeedingSetup ? ` · ${zonesNeedingSetup} need helpers` : ""}</div>
+            <div class="panel-body">
+              <div class="section-sub">Tell the card how many physical valves/switches you have, then point each row at its entity. “Set up helpers” makes the timer, schedule and enable helpers for them and fills in the Advanced fields automatically.</div>
+              <ha-form id="zone-count"></ha-form>
+              <div id="zones"></div>
+              <button class="setup ${zonesNeedingSetup ? "ready" : ""}" id="setup">
+                ⚙ Set up helpers${zonesNeedingSetup ? ` (${zonesNeedingSetup} zone${zonesNeedingSetup === 1 ? "" : "s"} need helpers)` : " — re-run to update"}
+              </button>
+              <div class="status" id="setup-status"></div>
+              <div class="hint">
+                “Set up helpers” creates one schedule / timer / enable helper per zone, the control
+                helpers (global enable, skip-next, rain delay, thresholds), a daily rainfall utility
+                meter + 48 h template sensor, and the dispatcher / rain-stop / safety automations — all
+                server-side (admin required). Editing a schedule’s days, time or duration regenerates
+                that zone’s helper from all its enabled schedules.
+              </div>
+            </div>
+          </ha-expansion-panel>
         </div>
       `;
 
@@ -2200,29 +2286,67 @@
         if (v.style !== prevStyle || v.device !== prevDevice) this._render();
       });
 
-      // ---- zones list
+      // ---- zone count: generates exactly N compact zone rows
+      const zoneCount = this.shadowRoot.getElementById("zone-count");
+      zoneCount.hass = this._hass;
+      zoneCount.schema = this._zoneCountSchema();
+      zoneCount.data = { zone_count: zones.length };
+      zoneCount.computeLabel = this._label;
+      zoneCount.computeHelper = this._helper;
+      zoneCount.addEventListener("value-changed", (ev) => {
+        ev.stopPropagation();
+        let n = Number(ev.detail.value?.zone_count);
+        if (!Number.isFinite(n)) return;
+        n = Math.max(0, Math.min(MAX_ZONES, Math.round(n)));
+        if (n === this._config.zones.length) return;
+        let newZones = [...this._config.zones];
+        let newSchedules = [...(this._config.schedules || [])];
+        if (n > newZones.length) {
+          while (newZones.length < n) newZones.push({});
+        } else {
+          const dropped = newZones.slice(n).map((z) => z?.entity).filter(Boolean);
+          newZones = newZones.slice(0, n);
+          // Drop schedules bound to a removed zone so nothing dangles.
+          newSchedules = newSchedules.filter((s) => !dropped.includes(s.zone));
+        }
+        this._config = { ...this._config, zones: newZones, schedules: newSchedules };
+        this._fire();
+        this._render();
+      });
+
+      // ---- zones list (one compact row per zone)
       const zonesEl = this.shadowRoot.getElementById("zones");
       zonesEl.style.display = "flex";
       zonesEl.style.flexDirection = "column";
       zonesEl.style.gap = "12px";
       zones.forEach((zone, idx) => {
-        const box = document.createElement("div");
-        box.className = "box";
-        box.innerHTML = `<div class="box-head"><span>Zone ${idx + 1}</span><button class="del" title="Remove zone">✕</button></div>`;
+        const row = document.createElement("div");
+        row.className = "zone-row";
+        row.innerHTML = `<div class="zone-num">Zone ${idx + 1}</div>`;
         const form = document.createElement("ha-form");
+        form.className = "zone-form";
         form.hass = this._hass;
         form.schema = this._zoneSchema();
-        form.data = zone;
+        form.data = this._zoneData(zone, idx);
         form.computeLabel = this._label;
+        form.computeHelper = this._helper;
         form.addEventListener("value-changed", (ev) => {
           ev.stopPropagation();
+          // Flatten the "advanced" expandable back into the zone (see playbook).
+          const v = ev.detail.value;
+          const flat = { ...v, ...(v.advanced || {}) };
+          delete flat.advanced;
           const newZones = [...this._config.zones];
-          newZones[idx] = { ...ev.detail.value };
+          newZones[idx] = flat;
           this._config = { ...this._config, zones: newZones };
           this._fire();
         });
-        box.appendChild(form);
-        box.querySelector(".del").addEventListener("click", () => {
+        row.appendChild(form);
+        const del = document.createElement("button");
+        del.className = "del";
+        del.title = "Remove zone";
+        del.textContent = "✕";
+        del.addEventListener("click", () => {
           const removed = this._config.zones[idx];
           const newZones = this._config.zones.filter((_, i) => i !== idx);
           // Drop schedules bound to a removed zone so nothing dangles.
@@ -2233,14 +2357,8 @@
           this._fire();
           this._render();
         });
-        zonesEl.appendChild(box);
-      });
-
-      this.shadowRoot.getElementById("add-zone")?.addEventListener("click", () => {
-        const newZones = [...this._config.zones, {}];
-        this._config = { ...this._config, zones: newZones };
-        this._fire();
-        this._render();
+        row.appendChild(del);
+        zonesEl.appendChild(row);
       });
 
       // ---- schedules list
