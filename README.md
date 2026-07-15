@@ -5,9 +5,9 @@ A Lovelace card for **weekly irrigation scheduling with rain smarts**, built aro
 It is the companion to [manual-irrigation-zone-card](https://github.com/mycrouch/manual-irrigation-zone-card): the manual card handles ad-hoc runs, this one handles the weekly programme. Both share the same timers and safety automations, so manual and scheduled runs use one reliability model.
 
 <p align="center">
-  <img src="images/card-wide.png" alt="Irrigation Schedule Card — a list of named schedules with plain-language summaries, two of them on the same Veggie Pods zone, one expanded to show its zone, day chips, start time and duration" width="540">
+  <img src="images/default-wide.png" alt="Irrigation Schedule Card — a list of named schedules with plain-language summaries, two of them on the same Veggie Pods zone, one expanded to show its zone, day chips, start time and duration" width="540">
   &nbsp;
-  <img src="images/card-narrow.png" alt="Irrigation Schedule Card — narrow layout showing the same schedule list with a running schedule and an expanded editor" width="300">
+  <img src="images/default-narrow.png" alt="Irrigation Schedule Card — narrow layout showing the same schedule list with a running schedule and an expanded editor" width="300">
 </p>
 
 ## Features
