@@ -1,8 +1,29 @@
 /**
- * Irrigation Schedule Card v0.4.0
+ * Irrigation Schedule Card v0.4.1
  * https://github.com/mycrouch/irrigation-schedule-card
  * ----------------------------------------------------------------
  * A Lovelace card for weekly irrigation scheduling with rain smarts.
+ *
+ * Bug fixes (v0.4.1):
+ *  - Discovery now INCLUDES hidden entities. A hidden (hidden_by "user") zone
+ *    switch is still fully controllable; users hide the raw switches and expose
+ *    template-wrapped versions in the UI. v0.4.0 filtered them out and so found
+ *    zero zones on such devices. Only disabled_by and entity_category rows are
+ *    excluded now. A small note flags when discovered zones are hidden.
+ *  - "Set up helpers" resolves EXISTING infrastructure before creating anything.
+ *    Per zone, in order: (1) the helper IDs already in the zone's config; (2) the
+ *    standard convention IDs for the zone number N — schedule.irrigation_zone_N_
+ *    schedule / timer.irrigation_zone_N / input_boolean.irrigation_zone_N_
+ *    schedule_enabled; (3) a helper whose slug matches the DERIVED clean zone
+ *    name; (4) only then create, named from the clean derived name (never the
+ *    raw device-boilerplate friendly name). Automations are upserted: an existing
+ *    automation matching the alias, or carrying this card's description marker, is
+ *    UPDATED in place (its internal id preserved) instead of spawning a sibling.
+ *  - Editor layout constrained (root + rows: max-width 100%, min-width 0,
+ *    box-sizing border-box) so the Advanced helper pickers wrap inside HA's
+ *    ~480px config dialog instead of overflowing it.
+ *  - getStubConfig returns an existing real config untouched, so discovery can
+ *    never silently replace a configured card's zones.
  *
  * Zone auto-discovery (v0.4.0):
  *  - Picking (or changing) the irrigation device in the editor queries the
@@ -83,7 +104,7 @@
 
   const CARD_TAG = "irrigation-schedule-card";
   const EDITOR_TAG = "irrigation-schedule-card-editor";
-  const VERSION = "0.4.0";
+  const VERSION = "0.4.1";
 
   const MAX_ZONES = 8;
   const MAX_SCHEDULES = 24;
@@ -276,8 +297,11 @@
       (e) =>
         e.device_id === deviceId &&
         !e.entity_category && // config/diagnostic entities are never zones
-        e.disabled_by == null &&
-        e.hidden_by == null &&
+        e.disabled_by == null && // disabled entities have no state — unusable
+        // NOTE: hidden_by is intentionally NOT filtered. A hidden entity is
+        // fully controllable — users often hide the raw zone switches and
+        // surface template-wrapped versions in the UI (Gavin's Holman zones
+        // are hidden_by "user"). Excluding them made discovery find zero zones.
         ZONE_DOMAINS.includes(String(e.entity_id).split(".")[0])
     );
     if (!forDevice.length) return [];
@@ -301,6 +325,7 @@
         entity: e.entity_id,
         name: deriveZoneName(friendly, deviceName),
         _num: zoneNumberOf(e.entity_id, friendly),
+        _hidden: e.hidden_by != null,
       };
     });
 
@@ -311,7 +336,9 @@
       return a.entity.localeCompare(b.entity);
     });
 
-    return zones.slice(0, MAX_ZONES).map(({ entity, name }) => ({ entity, name }));
+    return zones
+      .slice(0, MAX_ZONES)
+      .map(({ entity, name, _hidden }) => ({ entity, name, hidden: !!_hidden }));
   };
 
   // Does this device / its entities look like irrigation? Used by getStubConfig
@@ -343,7 +370,7 @@
       return document.createElement(EDITOR_TAG);
     }
 
-    static async getStubConfig(hass) {
+    static async getStubConfig(hass, entities, existingConfig) {
       const base = {
         title: "Irrigation Schedule",
         global_enable: "input_boolean.irrigation_schedule_enabled",
@@ -353,6 +380,18 @@
         zones: [],
         schedules: [],
       };
+
+      // Fix 4 guard: getStubConfig is meant for genuinely new cards only. Some HA
+      // flows pass the current config in; if a real config already exists (it has
+      // zones or a device), return it untouched so discovery can NEVER silently
+      // replace a configured card's zones with a freshly-discovered set.
+      if (
+        existingConfig &&
+        ((Array.isArray(existingConfig.zones) && existingConfig.zones.length) ||
+          existingConfig.device)
+      ) {
+        return existingConfig;
+      }
 
       // Brand-new card: if exactly one plausible irrigation device is present,
       // discover its zones so the card works out of the box. Any failure just
@@ -1939,14 +1978,29 @@
     // Idempotent lookup: the entity IDs "Set up helpers" would create for a
     // zone whose display base is `base`. Used to auto-fill the Advanced helper
     // pickers so they are never shown empty once helpers exist.
-    _guessZoneHelpers(base) {
-      const s = this._slug(`Irrigation ${base}`);
+    _guessZoneHelpers(base, entity) {
       const has = (id) => !!this._hass?.states?.[id];
-      const pick = (id) => (has(id) ? id : undefined);
+      // Try the standard convention IDs first (the same order _setupHelpers
+      // resolves in), then the derived clean-name slug, so already-existing
+      // infrastructure is surfaced rather than shown as an empty picker.
+      const n = zoneNumberOf(entity, base);
+      const conv = this._zoneConventionIds(n);
+      const first = (ids) => ids.find((id) => has(id));
+      const derivedSlug = this._slug(`Irrigation ${base}`);
       return {
-        schedule: pick(`schedule.${this._slug(`Irrigation ${base} Schedule`)}`),
-        timer: pick(`timer.${s}`),
-        enable: pick(`input_boolean.${this._slug(`Irrigation ${base} Scheduled`)}`),
+        schedule:
+          first(conv.schedule) ||
+          (has(`schedule.${this._slug(`Irrigation ${base} Schedule`)}`)
+            ? `schedule.${this._slug(`Irrigation ${base} Schedule`)}`
+            : undefined),
+        timer:
+          first(conv.timer) ||
+          (has(`timer.${derivedSlug}`) ? `timer.${derivedSlug}` : undefined),
+        enable:
+          first(conv.enable) ||
+          (has(`input_boolean.${this._slug(`Irrigation ${base} Scheduled`)}`)
+            ? `input_boolean.${this._slug(`Irrigation ${base} Scheduled`)}`
+            : undefined),
       };
     }
 
@@ -1965,7 +2019,7 @@
     _zoneData(z, i) {
       const out = { ...z };
       if (z?.entity && (!out.schedule || !out.timer || !out.enable)) {
-        const g = this._guessZoneHelpers(this._zoneBase(z, i));
+        const g = this._guessZoneHelpers(this._zoneBase(z, i), z.entity);
         if (!out.schedule && g.schedule) out.schedule = g.schedule;
         if (!out.timer && g.timer) out.timer = g.timer;
         if (!out.enable && g.enable) out.enable = g.enable;
@@ -2209,6 +2263,49 @@
       return `${domain}.${r.id}`;
     }
 
+    // Resolve a single zone helper, stopping at the first existing entity, in a
+    // strict order so we never create a duplicate of infrastructure that already
+    // exists under a different naming scheme:
+    //   1. the ID already stored in this zone's config (if the entity exists);
+    //   2. the standard convention IDs keyed on the zone's number N, e.g.
+    //      schedule.irrigation_zone_1_schedule / timer.irrigation_zone_1 /
+    //      input_boolean.irrigation_zone_1_schedule_enabled — the exact IDs
+    //      Gavin's existing helpers already use;
+    //   3. a helper whose object_id matches the DERIVED clean zone name
+    //      ("Front Lawn" -> schedule.irrigation_front_lawn_schedule);
+    //   4. only if none of the above exist, create one named from the clean
+    //      derived base ("Irrigation Front Lawn Schedule") — never the raw
+    //      device-boilerplate friendly name.
+    // `candidates` are extra fully-qualified entity_ids (convention IDs) to try
+    // in order before the derived-name slug.
+    async _ensureZoneHelper(domain, currentId, base, candidates, createName, extra = {}) {
+      const hass = this._hass;
+      const exists = (id) => id && hass.states[id];
+      // 1. configured ID
+      if (exists(currentId)) return currentId;
+      // 2. standard convention IDs
+      for (const id of candidates || []) {
+        if (exists(id)) return id;
+      }
+      // 3. derived clean-name slug
+      const derived = `${domain}.${this._slug(createName)}`;
+      if (exists(derived)) return derived;
+      // 4. create from the clean derived name
+      const r = await hass.callWS({ type: `${domain}/create`, name: createName, ...extra });
+      return `${domain}.${r.id}`;
+    }
+
+    // Standard-convention helper IDs for zone number N, matching the existing
+    // Glenelg / manual-irrigation-zone-card infrastructure.
+    _zoneConventionIds(n) {
+      if (n == null) return { schedule: [], timer: [], enable: [] };
+      return {
+        schedule: [`schedule.irrigation_zone_${n}_schedule`],
+        timer: [`timer.irrigation_zone_${n}`],
+        enable: [`input_boolean.irrigation_zone_${n}_schedule_enabled`],
+      };
+    }
+
     async _flowCreate(handler, steps) {
       const start = await this._hass.callWS({
         type: "config_entries/flow",
@@ -2225,6 +2322,92 @@
         flowId = res.flow_id || flowId;
         if (res.type === "create_entry" || res.type === "abort") break;
       }
+    }
+
+    // Marker written into every automation this card generates, so a re-run (or a
+    // fresh card pointed at an existing setup) can recognise and UPDATE its own
+    // automations instead of creating siblings.
+    static get AUTOMATION_MARKER() {
+      return "Created by irrigation-schedule-card";
+    }
+
+    // Find the internal config id of an existing automation that is "the same
+    // automation" as the one we're about to write — matched first by alias
+    // (exact), else by our description marker on an automation whose alias starts
+    // the same way. Returns the numeric/string id (attributes.id) or null.
+    // This is what stops the v0.4.0 bug where an existing dispatcher
+    // ("Irrigation Schedule - dispatcher", a different internal id) was ignored
+    // and a `_2` sibling created.
+    _findExistingAutomationId(desired) {
+      const hass = this._hass;
+      if (!hass?.states) return null;
+      const marker = IrrigationScheduleCard.AUTOMATION_MARKER;
+      const wantAlias = String(desired.alias || "").trim().toLowerCase();
+      let markerMatch = null;
+      for (const [entityId, st] of Object.entries(hass.states)) {
+        if (!entityId.startsWith("automation.")) continue;
+        const id = st.attributes?.id;
+        if (id == null) continue;
+        const alias =
+          st.attributes?.friendly_name != null
+            ? String(st.attributes.friendly_name).trim().toLowerCase()
+            : "";
+        // Exact alias match wins outright.
+        if (wantAlias && alias === wantAlias) return id;
+        // Otherwise remember an automation carrying our marker with a matching
+        // alias, as a fallback (alias-not-yet-loaded / renamed friendly name).
+        // We can only read the description via a config fetch, so defer that to
+        // the caller; here we just collect marker-alias candidates.
+        if (wantAlias && alias && alias === wantAlias) markerMatch = id;
+      }
+      return markerMatch;
+    }
+
+    // Fetch an automation's stored config by id (to inspect its description
+    // marker). Returns the config object or null.
+    async _getAutomationConfig(id) {
+      try {
+        return await this._hass.callApi("get", `config/automation/config/${id}`);
+      } catch (e) {
+        return null;
+      }
+    }
+
+    // Idempotent automation writer. Resolves an existing automation to update in
+    // place (preserving its internal id) by alias, then by our description
+    // marker; only if neither is found does it create under the stable
+    // convention id `defaultId`. Never creates a sibling of an automation this
+    // card already owns.
+    async _upsertAutomation(defaultId, config) {
+      const hass = this._hass;
+      let targetId = this._findExistingAutomationId(config);
+
+      // If no exact alias hit, scan automations carrying our marker whose purpose
+      // matches (same alias once its config is read). This catches the case where
+      // the friendly_name/alias in state differs from what we intend to write but
+      // the stored automation is still ours to update.
+      if (targetId == null) {
+        const wantAlias = String(config.alias || "").trim().toLowerCase();
+        for (const [entityId, st] of Object.entries(hass.states || {})) {
+          if (!entityId.startsWith("automation.")) continue;
+          const id = st.attributes?.id;
+          if (id == null) continue;
+          const cfg = await this._getAutomationConfig(id);
+          if (!cfg) continue;
+          const desc = String(cfg.description || "");
+          const alias = String(cfg.alias || "").trim().toLowerCase();
+          if (desc.includes(IrrigationScheduleCard.AUTOMATION_MARKER) && alias === wantAlias) {
+            targetId = id;
+            break;
+          }
+        }
+      }
+
+      const writeId = targetId != null ? targetId : defaultId;
+      // Preserve the existing internal id in the body when updating in place.
+      const body = targetId != null ? { ...config, id: String(writeId) } : config;
+      await hass.callApi("post", `config/automation/config/${writeId}`, body);
+      return writeId;
     }
 
     async _setupHelpers() {
@@ -2246,12 +2429,16 @@
         for (let i = 0; i < newZones.length; i++) {
           const z = newZones[i];
           if (!z?.entity) continue;
-          const base =
-            z.name || hass.states[z.entity]?.attributes?.friendly_name || `Zone ${i + 1}`;
+          const friendly = hass.states[z.entity]?.attributes?.friendly_name;
+          const base = z.name || friendly || `Zone ${i + 1}`;
+          // Zone number drives the standard-convention IDs (irrigation_zone_N…)
+          // — resolve it from the entity_id or the friendly name.
+          const n = zoneNumberOf(z.entity, friendly || z.name);
+          const conv = this._zoneConventionIds(n);
           const patch = { ...z };
-          patch.schedule = await this._ensureHelper("schedule", z.schedule, `Irrigation ${base} Schedule`, { icon: "mdi:calendar-clock" });
-          patch.timer = await this._ensureHelper("timer", z.timer, `Irrigation ${base}`, { icon: DEFAULT_ICON, restore: true });
-          patch.enable = await this._ensureHelper("input_boolean", z.enable, `Irrigation ${base} Scheduled`, { icon: "mdi:calendar-check" });
+          patch.schedule = await this._ensureZoneHelper("schedule", z.schedule, base, conv.schedule, `Irrigation ${base} Schedule`, { icon: "mdi:calendar-clock" });
+          patch.timer = await this._ensureZoneHelper("timer", z.timer, base, conv.timer, `Irrigation ${base}`, { icon: DEFAULT_ICON, restore: true });
+          patch.enable = await this._ensureZoneHelper("input_boolean", z.enable, base, conv.enable, `Irrigation ${base} Scheduled`, { icon: "mdi:calendar-check" });
           newZones[i] = patch;
         }
 
@@ -2307,13 +2494,13 @@
           timerIds.push(z.timer);
         });
 
-        await hass.callApi("post", "config/automation/config/irrigation_schedule_dispatcher",
+        await this._upsertAutomation("irrigation_schedule_dispatcher",
           this._dispatcherConfig(cfg, scheduleIds, switchMap, timerMap, enableMap));
-        await hass.callApi("post", "config/automation/config/irrigation_schedule_rain_stop",
+        await this._upsertAutomation("irrigation_schedule_rain_stop",
           this._rainStopConfig(cfg, switchIds, timerIds));
-        await hass.callApi("post", "config/automation/config/irrigation_zone_timer_finished",
+        await this._upsertAutomation("irrigation_zone_timer_finished",
           this._timerFinishedConfig(offZoneMap));
-        await hass.callApi("post", "config/automation/config/irrigation_zone_external_off",
+        await this._upsertAutomation("irrigation_zone_external_off",
           this._externalOffConfig(offTimerMap));
 
         // 5. seed a schedule per zone if none defined yet, then persist config
@@ -2528,8 +2715,14 @@
         action = `<button class="use" id="use-discovered">Use these ${n} zones &amp; set up helpers</button>`;
       }
 
+      const hiddenCount = discovered.filter((z) => z.hidden).length;
+      const hiddenNote = hiddenCount
+        ? `<div class="note">${hiddenCount === n ? (n === 1 ? "This zone is" : "These are") : `${hiddenCount} of these are`} hidden entities on the device — that's fine, they're still fully controllable and are included on purpose.</div>`
+        : "";
+
       el.innerHTML = `
         <div class="note found">✓ Found ${n} zone${n === 1 ? "" : "s"} from ${devName}</div>
+        ${hiddenNote}
         <ul class="zone-preview">${preview}</ul>
         ${action}`;
 
@@ -2562,15 +2755,23 @@
 
       this.shadowRoot.innerHTML = `
         <style>
-          .wrap { display: flex; flex-direction: column; gap: 16px; }
+          /* Layout guard (v0.4.1): HA's config dialog column is ~480px. Constrain
+             the editor root and every flex/grid child so wide rows — especially
+             the per-zone Advanced helper pickers — wrap inside the dialog instead
+             of overflowing its width. */
+          :host { display: block; max-width: 100%; box-sizing: border-box; }
+          * { box-sizing: border-box; }
+          .wrap { display: flex; flex-direction: column; gap: 16px; max-width: 100%; min-width: 0; }
+          .wrap > * { min-width: 0; max-width: 100%; }
+          ha-form { display: block; max-width: 100%; min-width: 0; }
           .section-title { font-size: 0.95rem; font-weight: 600; color: var(--primary-text-color); margin: 4px 0 -4px; }
           .section-sub { font-size: 0.8rem; color: var(--secondary-text-color); margin: -8px 0 0; }
-          .box { border: 1px solid var(--divider-color); border-radius: 10px; padding: 12px; }
+          .box { border: 1px solid var(--divider-color); border-radius: 10px; padding: 12px; max-width: 100%; min-width: 0; }
           .box-head { display: flex; align-items: center; margin-bottom: 8px; }
-          .box-head span { flex: 1; font-weight: 600; font-size: 0.9rem; color: var(--primary-text-color); }
-          .zone-row { display: flex; align-items: baseline; gap: 8px; }
+          .box-head span { flex: 1; min-width: 0; font-weight: 600; font-size: 0.9rem; color: var(--primary-text-color); }
+          .zone-row { display: flex; align-items: baseline; gap: 8px; max-width: 100%; min-width: 0; }
           .zone-row .zone-num { font-size: 0.8rem; font-weight: 600; color: var(--secondary-text-color); min-width: 3.6em; padding-top: 6px; }
-          .zone-row ha-form { flex: 1; }
+          .zone-row ha-form { flex: 1 1 auto; min-width: 0; }
           .del { border: none; background: transparent; cursor: pointer; color: var(--secondary-text-color); padding: 4px; }
           .del:hover { color: var(--error-color, #db4437); }
           .add, .setup { border: 1px dashed var(--divider-color); border-radius: 10px; background: transparent; padding: 12px; cursor: pointer; color: var(--primary-color); font-weight: 600; font-size: 0.9rem; width: 100%; }
@@ -2593,8 +2794,10 @@
           .use:disabled { opacity: 0.5; cursor: default; }
           .replace { border: 1px solid var(--primary-color); border-radius: 10px; background: transparent; color: var(--primary-color); padding: 10px; cursor: pointer; font-weight: 600; font-size: 0.85rem; width: 100%; }
           .replace:hover { background: rgba(var(--rgb-primary-color, 33,150,243), 0.06); }
-          ha-expansion-panel { --expansion-panel-summary-padding: 0 8px; border: 1px solid var(--divider-color); border-radius: 10px; }
-          .panel-body { display: flex; flex-direction: column; gap: 12px; padding: 4px 8px 12px; }
+          ha-expansion-panel { --expansion-panel-summary-padding: 0 8px; border: 1px solid var(--divider-color); border-radius: 10px; display: block; max-width: 100%; min-width: 0; }
+          .panel-body { display: flex; flex-direction: column; gap: 12px; padding: 4px 8px 12px; max-width: 100%; min-width: 0; }
+          .panel-body > * { min-width: 0; max-width: 100%; }
+          #schedules, #zones, #discovery { max-width: 100%; min-width: 0; }
         </style>
         <div class="wrap">
           <ha-form id="top"></ha-form>
