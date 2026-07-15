@@ -19,6 +19,7 @@ It is the companion to [manual-irrigation-zone-card](https://github.com/mycrouch
 - **Rain-delay and skip controls.** One-tap 24 h / 48 h / 72 h rain delays with a clear button, plus a "Skip next run" button that self-clears after one cycle. A master switch turns the whole programme on or off.
 - **Fail-safe by design.** If the rain data is missing or stale, the schedule **runs anyway** and the card says so — watering is never silently skipped.
 - **Missing helpers? One-tap Create.** If a configured helper is missing, an admin gets a **Create** button right where the control would be, instead of a bare error. The one-click setup is idempotent — re-running fills gaps and never creates duplicates.
+- **Zone auto-discovery.** Pick your irrigation device in the editor and the card reads its zones straight from the entity registry (not from entity-ID guesswork), skipping any config/diagnostic entities. It derives clean display names from the friendly names — *"Holman - (Zone 1) Front Lawn"* becomes **Front Lawn** — orders them by zone number, and proposes the list without clobbering anything. One **Use these zones & set up helpers** button applies them and runs the server-side setup in a single action. Brand-new cards even self-configure when they can find a single plausible irrigation device.
 - **Schedule-first editor.** The editor leads with your **Schedules** list — **+ Add schedule** is the primary action, right under the basics. One-time zone setup is tucked into a collapsed **Zones in your system** section below (alongside Control helpers and Rain smarts): set how many zones you have, point each compact row at its switch/valve, and click **Set up helpers** to create the timer / schedule / enable helpers, the control helpers, the rainfall utility meter + 48 h template sensor and the dispatcher / rain-stop / safety automations — all server-side, no YAML. Setup then auto-fills each zone's helper fields (kept out of the way under a per-zone **Advanced** expander), so you never see empty pickers in the normal flow. A card-level default duration seeds new schedules; each keeps its own after that. Per-card style option (default / theme / manual gradient).
 
 ## How it works
@@ -56,10 +57,17 @@ The card watches the weather so it doesn't water a wet garden, using **two indep
 
 ## Configuration
 
-Add the card from the dashboard's card picker ("Irrigation Schedule Card") and use the **GUI editor** — it is the intended way to configure this card. It leads with schedules:
+Add the card from the dashboard's card picker ("Irrigation Schedule Card") and use the **GUI editor** — it is the intended way to configure this card. Quick start, three steps:
 
-1. **Schedules** (top of the editor). **+ Add schedule**, give it a name, pick which zone it waters, tick its days, set the start time and duration, and enable it. Add another for the same zone if you want a second watering (e.g. a weekend deep soak). You can also edit a schedule's days, time and duration straight on the card face. If you haven't defined any zones yet, this button is disabled with a hint to set your zones up first.
-2. **Zones in your system** (collapsed section below, next to Control helpers and Rain smarts). Open it once during setup: set **how many zones** your system has — a compact row appears for each — and point every row at its switch/valve entity (optionally give it a display name and icon). Pick your rain sensors under **Rain smarts**. Then click **⚙ Set up helpers** (admin required) — the card creates the timer / schedule / enable helper per zone, the control helpers, the rainfall utility meter + 48 h sensor and the automations, fills the config in for you, and auto-fills each zone's helper fields under its **Advanced** expander (so those pickers are never shown empty; open Advanced only if you want to point a zone at existing helpers instead).
+1. **Pick your device.** In **Irrigation device** (near the top of the editor) choose your irrigation controller. The card reads its zones straight from the entity registry and shows *"✓ Found N zones from &lt;device&gt;"* with each zone's derived display name (e.g. *"Holman - (Zone 1) Front Lawn"* becomes **Front Lawn**), ordered by zone number.
+2. **Confirm the discovered zones.** Click **Use these N zones & set up helpers**. In one action the card fills in the zones and runs the server-side setup (admin required) — creating the timer / schedule / enable helper per zone, the control helpers, the rainfall utility meter + 48 h sensor and the automations, and auto-filling each zone's Advanced fields. You can rename, remove or add zones before or after. If zones are already configured and you pick a device again, the card offers **Replace zones with N discovered** rather than overwriting silently.
+3. **Add your schedules.** In **Schedules** (top of the editor) click **+ Add schedule**, give it a name, pick which zone it waters, tick its days, set the start time and duration, and enable it. Add another for the same zone if you want a second watering (e.g. a weekend deep soak). You can also edit a schedule's days, time and duration straight on the card face.
+
+Brand-new cards dropped onto a dashboard also auto-discover: if exactly one plausible irrigation device is found (a device or entity named after irrigation/sprinkler/water), the card starts with its zones already populated.
+
+**Manual setup (fallback for mixed / multi-device systems).** You don't have to use discovery. Open **Zones in your system** (collapsed section, next to Control helpers and Rain smarts), set **how many zones** your system has — a compact row appears for each — and point every row at its switch/valve entity (optionally a display name and icon). Pick your rain sensors under **Rain smarts**, then click **⚙ Set up helpers**. This is the same setup discovery runs, just with the zone list built by hand — use it when your zones live across several devices or don't come from a single controller.
+
+> Zone discovery only ever runs from an explicit action in the editor (picking a device, or the discovery buttons) or from the stub config for a brand-new card. It never touches an already-configured, deployed card on its own, and existing configs are unaffected.
 
 ### YAML example
 
@@ -108,7 +116,7 @@ schedules:
 | `theme` | string | — | Installed theme name, when `style: theme`. |
 | `color_from` / `color_to` | hex | `#0f2f4a` / `#039be5` | Gradient colours, when `style: manual`. |
 | `default_minutes` | number | `15` | Seeds the run duration when you add a new schedule. Each schedule keeps its own after that. |
-| `device` | string | — | Irrigation device id — filters the zone entity pickers in the editor. |
+| `device` | string | — | Irrigation device id. Picking it in the editor auto-discovers the device's zones from the entity registry and filters the zone entity pickers. |
 | `global_enable` | entity | — | `input_boolean` master switch for the whole schedule. |
 | `skip_next` | entity | — | `input_boolean` that skips the next scheduled run (self-clears). |
 | `rain_delay` | entity | — | `input_datetime` holding the "delay until" time. |

@@ -1,8 +1,30 @@
 /**
- * Irrigation Schedule Card v0.3.1
+ * Irrigation Schedule Card v0.4.0
  * https://github.com/mycrouch/irrigation-schedule-card
  * ----------------------------------------------------------------
  * A Lovelace card for weekly irrigation scheduling with rain smarts.
+ *
+ * Zone auto-discovery (v0.4.0):
+ *  - Picking (or changing) the irrigation device in the editor queries the
+ *    entity registry (config/entity_registry/list) for that device's entities,
+ *    keeps the zone-capable domains (switch / valve; light / input_boolean only
+ *    as a fallback when nothing else matches), and EXCLUDES entities with an
+ *    entity_category (config/diagnostic — never a watering zone). Siblings are
+ *    resolved through the registry's device_id, never a naming convention.
+ *  - Display names are derived from friendly names by stripping the device-name
+ *    boilerplate and zone-number decorations — e.g. "Holman - (Zone 1) Front
+ *    Lawn" → "Front Lawn" — with the trimmed friendly name kept as a fallback.
+ *    Zones are ordered by a parsed zone number (from entity_id or name), else by
+ *    entity_id.
+ *  - Discovery never clobbers silently: the discovered zones are proposed in the
+ *    Zones section with a "Found N zones from <device>" note. If zones are
+ *    already configured, a "Replace zones with N discovered" action is offered
+ *    instead of overwriting. A single prominent "Use these zones & set up
+ *    helpers" action applies the list and runs the idempotent helper setup in one
+ *    go. The manual per-zone flow stays as the fallback for mixed/multi-device
+ *    systems, and existing (already-configured) cards are never touched —
+ *    discovery only runs from an explicit editor action, or from getStubConfig
+ *    for a brand-new card that finds exactly one plausible irrigation device.
  *
  * Schedule-centric model (v0.3.0):
  *  - Schedules are the first-class object. A schedule is a display name, one
@@ -61,7 +83,7 @@
 
   const CARD_TAG = "irrigation-schedule-card";
   const EDITOR_TAG = "irrigation-schedule-card-editor";
-  const VERSION = "0.3.1";
+  const VERSION = "0.4.0";
 
   const MAX_ZONES = 8;
   const MAX_SCHEDULES = 24;
@@ -177,6 +199,128 @@
   const newScheduleId = () =>
     `s${Date.now().toString(36)}${(SCHED_SEQ++).toString(36)}`;
 
+  /* ------------------------------------------------ zone discovery */
+
+  // Zone-capable domains. switch/valve are the real thing; light/input_boolean
+  // are only accepted as a fallback when a device exposes nothing better.
+  const PRIMARY_ZONE_DOMAINS = ["switch", "valve"];
+  const FALLBACK_ZONE_DOMAINS = ["light", "input_boolean"];
+  const ZONE_DOMAINS = [...PRIMARY_ZONE_DOMAINS, ...FALLBACK_ZONE_DOMAINS];
+
+  const IRRIGATION_KEYWORDS = [
+    "irrigation",
+    "sprinkler",
+    "watering",
+    "water system",
+    "reticulation",
+    "garden water",
+    "holman",
+  ];
+
+  // Pull a zone number out of an entity_id or a name, if one is expressed.
+  // Matches "zone 1", "zone_1", "z1", or a lone trailing "... 3".
+  const zoneNumberOf = (entityId, name) => {
+    const hay = `${name || ""} ${entityId || ""}`.toLowerCase();
+    let m = hay.match(/zone[\s_-]*0*(\d+)/);
+    if (m) return Number(m[1]);
+    m = hay.match(/\bz0*(\d+)\b/);
+    if (m) return Number(m[1]);
+    m = String(entityId || "").match(/_0*(\d+)(?:$|[^0-9])/);
+    if (m) return Number(m[1]);
+    return null;
+  };
+
+  // Derive a clean display name from a friendly name by stripping device-name
+  // boilerplate and zone-number decorations. Keeps the trimmed friendly name as
+  // a fallback so a name is never lost.
+  // e.g. deviceName "Holman Water System (Local)",
+  //      friendly  "Holman - (Zone 1) Front Lawn"  ->  "Front Lawn".
+  const deriveZoneName = (friendlyName, deviceName) => {
+    const original = String(friendlyName || "").trim();
+    if (!original) return "";
+    let s = original;
+
+    // Strip a leading device-name prefix followed by a separator, using both
+    // the full device name and its first word (integrations often prefix just
+    // the brand, e.g. "Holman - ...").
+    const prefixes = [];
+    if (deviceName) {
+      prefixes.push(deviceName);
+      const first = String(deviceName).trim().split(/[\s(]+/)[0];
+      if (first && first.length > 2) prefixes.push(first);
+    }
+    for (const p of prefixes) {
+      const esc = p.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      const re = new RegExp(`^\\s*${esc}\\s*[-:_·|/]*\\s*`, "i");
+      if (re.test(s)) {
+        s = s.replace(re, "");
+        break;
+      }
+    }
+
+    // Strip zone-number decorations anywhere: "(Zone 1)", "Zone 1", "Zone-1",
+    // and leftover bracket punctuation.
+    s = s.replace(/\(?\s*zone[\s_-]*0*\d+\s*\)?/gi, " ");
+    // Tidy stray separators/brackets and collapse whitespace.
+    s = s.replace(/[()]/g, " ").replace(/^[\s\-:_·|/]+|[\s\-:_·|/]+$/g, "");
+    s = s.replace(/\s+/g, " ").trim();
+
+    return s || original;
+  };
+
+  // Given the entity registry list + states + a device id, produce the ordered
+  // list of discovered zone descriptors { entity, name }. Pure/testable.
+  const discoverZonesFromRegistry = (registry, states, deviceId, deviceName) => {
+    if (!Array.isArray(registry) || !deviceId) return [];
+    const forDevice = registry.filter(
+      (e) =>
+        e.device_id === deviceId &&
+        !e.entity_category && // config/diagnostic entities are never zones
+        e.disabled_by == null &&
+        e.hidden_by == null &&
+        ZONE_DOMAINS.includes(String(e.entity_id).split(".")[0])
+    );
+    if (!forDevice.length) return [];
+
+    // Prefer primary domains; only fall back to light/input_boolean when the
+    // device exposes none of switch/valve.
+    const primary = forDevice.filter((e) =>
+      PRIMARY_ZONE_DOMAINS.includes(String(e.entity_id).split(".")[0])
+    );
+    const chosen = primary.length ? primary : forDevice;
+
+    const friendlyOf = (e) =>
+      states?.[e.entity_id]?.attributes?.friendly_name ||
+      e.name ||
+      e.original_name ||
+      titleize(objectId(e.entity_id));
+
+    const zones = chosen.map((e) => {
+      const friendly = friendlyOf(e);
+      return {
+        entity: e.entity_id,
+        name: deriveZoneName(friendly, deviceName),
+        _num: zoneNumberOf(e.entity_id, friendly),
+      };
+    });
+
+    zones.sort((a, b) => {
+      if (a._num != null && b._num != null) return a._num - b._num;
+      if (a._num != null) return -1;
+      if (b._num != null) return 1;
+      return a.entity.localeCompare(b.entity);
+    });
+
+    return zones.slice(0, MAX_ZONES).map(({ entity, name }) => ({ entity, name }));
+  };
+
+  // Does this device / its entities look like irrigation? Used by getStubConfig
+  // to pick a single plausible device out of the box.
+  const looksLikeIrrigation = (text) => {
+    const t = String(text || "").toLowerCase();
+    return IRRIGATION_KEYWORDS.some((k) => t.includes(k));
+  };
+
   /* ============================================================ CARD */
 
   class IrrigationScheduleCard extends HTMLElement {
@@ -199,8 +343,8 @@
       return document.createElement(EDITOR_TAG);
     }
 
-    static getStubConfig() {
-      return {
+    static async getStubConfig(hass) {
+      const base = {
         title: "Irrigation Schedule",
         global_enable: "input_boolean.irrigation_schedule_enabled",
         skip_next: "input_boolean.irrigation_skip_next_run",
@@ -209,6 +353,55 @@
         zones: [],
         schedules: [],
       };
+
+      // Brand-new card: if exactly one plausible irrigation device is present,
+      // discover its zones so the card works out of the box. Any failure just
+      // returns the plain stub — the editor's device picker still runs discovery.
+      try {
+        if (!hass?.callWS || !hass?.devices) return base;
+
+        const registry = await hass.callWS({ type: "config/entity_registry/list" });
+        const byDevice = new Map();
+        (registry || []).forEach((e) => {
+          if (!e.device_id) return;
+          if (!byDevice.has(e.device_id)) byDevice.set(e.device_id, []);
+          byDevice.get(e.device_id).push(e);
+        });
+
+        const candidates = [];
+        Object.values(hass.devices).forEach((dev) => {
+          const ents = byDevice.get(dev.id) || [];
+          const hasZoneEntity = ents.some(
+            (e) =>
+              !e.entity_category &&
+              ZONE_DOMAINS.includes(String(e.entity_id).split(".")[0])
+          );
+          if (!hasZoneEntity) return;
+          const devName = dev.name_by_user || dev.name || "";
+          const entText = ents
+            .map(
+              (e) =>
+                e.name ||
+                e.original_name ||
+                hass.states?.[e.entity_id]?.attributes?.friendly_name ||
+                e.entity_id
+            )
+            .join(" ");
+          if (looksLikeIrrigation(`${devName} ${entText}`)) {
+            candidates.push({ id: dev.id, name: dev.name_by_user || dev.name });
+          }
+        });
+
+        if (candidates.length !== 1) return base;
+
+        const dev = candidates[0];
+        const zones = discoverZonesFromRegistry(registry, hass.states, dev.id, dev.name);
+        if (!zones.length) return base;
+
+        return { ...base, device: dev.id, zones };
+      } catch (e) {
+        return base;
+      }
     }
 
     setConfig(config) {
@@ -1526,6 +1719,10 @@
       this.attachShadow({ mode: "open" });
       this._rendered = false;
       this._settingUp = false;
+      this._registry = null; // cached entity_registry list
+      this._registryDevice = null; // device id the last discovery ran for
+      this._discovered = null; // last discovered zone list (proposal)
+      this._discovering = false;
     }
 
     connectedCallback() {
@@ -1583,9 +1780,21 @@
     }
 
     set hass(hass) {
+      const firstHass = !this._hass;
       this._hass = hass;
       this.shadowRoot?.querySelectorAll("ha-form").forEach((f) => (f.hass = hass));
-      if (!this._rendered) this._render();
+      if (!this._rendered) {
+        this._render();
+      } else if (
+        firstHass &&
+        this._config?.device &&
+        this._registryDevice !== this._config.device &&
+        !this._discovering
+      ) {
+        // hass arrived after the first render — run discovery for the
+        // already-configured device now.
+        this._runDiscovery();
+      }
     }
 
     _topData() {
@@ -1909,6 +2118,86 @@
       return slugify(text);
     }
 
+    /* ------------------------------------------ zone auto-discovery */
+
+    _deviceName() {
+      const d = this._config?.device;
+      if (!d) return "";
+      const dev = this._hass?.devices?.[d];
+      return dev?.name_by_user || dev?.name || "";
+    }
+
+    async _loadRegistry(force = false) {
+      if (this._registry && !force) return this._registry;
+      if (!this._hass?.callWS) return null;
+      this._registry = await this._hass.callWS({
+        type: "config/entity_registry/list",
+      });
+      return this._registry;
+    }
+
+    // Run discovery for the currently-selected device. Stores the proposal in
+    // this._discovered and re-renders the zones section (never mutates config).
+    async _runDiscovery(force = false) {
+      const device = this._config?.device;
+      if (!device) {
+        this._discovered = null;
+        this._registryDevice = null;
+        return;
+      }
+      if (!force && this._registryDevice === device && this._discovered) return;
+      this._discovering = true;
+      this._renderDiscovery();
+      try {
+        const registry = await this._loadRegistry(force);
+        const zones = discoverZonesFromRegistry(
+          registry,
+          this._hass?.states,
+          device,
+          this._deviceName()
+        );
+        this._discovered = zones;
+        this._registryDevice = device;
+      } catch (e) {
+        console.error(`${CARD_TAG} discovery failed`, e);
+        this._discovered = [];
+      } finally {
+        this._discovering = false;
+        this._renderDiscovery();
+      }
+    }
+
+    // Apply the discovered zones into config. Preserves any per-zone helper
+    // overrides already stored for the same entity, and drops schedules bound to
+    // zones that no longer exist.
+    _applyDiscovered() {
+      const discovered = this._discovered || [];
+      if (!discovered.length) return;
+      const prevByEntity = new Map(
+        (this._config.zones || [])
+          .filter((z) => z?.entity)
+          .map((z) => [z.entity, z])
+      );
+      const newZones = discovered.map((d) => {
+        const prev = prevByEntity.get(d.entity) || {};
+        return { ...prev, entity: d.entity, name: d.name };
+      });
+      const validEntities = new Set(newZones.map((z) => z.entity));
+      const newSchedules = (this._config.schedules || []).filter(
+        (s) => !s.zone || validEntities.has(s.zone)
+      );
+      this._config = { ...this._config, zones: newZones, schedules: newSchedules };
+      this._fire();
+    }
+
+    // "Use these zones & set up helpers": apply the proposal, then run the
+    // idempotent server-side setup in one action.
+    async _useDiscoveredAndSetup() {
+      this._applyDiscovered();
+      this._render();
+      await this._setupHelpers();
+    }
+
     /* ---------------------------------------- one-click helper setup */
 
     async _ensureHelper(domain, currentId, name, extra = {}) {
@@ -2184,6 +2473,83 @@
 
     /* ---------------------------------------------------- render */
 
+    // Patch the discovery block in place (called after async discovery so the
+    // rest of the editor keeps its DOM and input focus).
+    _renderDiscovery() {
+      const el = this.shadowRoot?.getElementById("discovery");
+      if (!el) return;
+      el.className = "discovery";
+
+      if (!this._config?.device) {
+        el.innerHTML = "";
+        return;
+      }
+      if (this._discovering) {
+        el.innerHTML = `<div class="note">Looking for zones on ${this._escape(this._deviceName() || "the selected device")}…</div>`;
+        return;
+      }
+
+      const discovered = this._discovered;
+      if (!discovered) {
+        el.innerHTML = "";
+        return;
+      }
+      if (!discovered.length) {
+        el.innerHTML = `<div class="note">No zone switches or valves found on ${this._escape(this._deviceName() || "this device")}. Add zones manually below.</div>`;
+        return;
+      }
+
+      const devName = this._escape(this._deviceName() || "the device");
+      const n = discovered.length;
+      const preview = discovered
+        .map(
+          (z, i) =>
+            `<li><span class="num">Zone ${i + 1}</span><span>${this._escape(z.name)}</span><span class="eid">${this._escape(z.entity)}</span></li>`
+        )
+        .join("");
+
+      // Are these zones already the configured ones? (avoid nagging.)
+      const configured = (this._config.zones || []).filter((z) => z?.entity);
+      const sameAsConfig =
+        configured.length === discovered.length &&
+        configured.every((z, i) => z.entity === discovered[i].entity);
+
+      const hasZones = configured.length > 0;
+
+      let action = "";
+      if (sameAsConfig) {
+        action = `<div class="note">These zones are already set up. Re-run “Set up helpers” below if you added or renamed one.</div>`;
+      } else if (hasZones) {
+        // Don't clobber: offer to replace, plus the one-action path.
+        action = `
+          <button class="replace" id="replace-zones">Replace zones with ${n} discovered</button>
+          <button class="use" id="use-discovered">Use these zones &amp; set up helpers</button>`;
+      } else {
+        action = `<button class="use" id="use-discovered">Use these ${n} zones &amp; set up helpers</button>`;
+      }
+
+      el.innerHTML = `
+        <div class="note found">✓ Found ${n} zone${n === 1 ? "" : "s"} from ${devName}</div>
+        <ul class="zone-preview">${preview}</ul>
+        ${action}`;
+
+      el.querySelector("#use-discovered")?.addEventListener("click", () =>
+        this._useDiscoveredAndSetup()
+      );
+      el.querySelector("#replace-zones")?.addEventListener("click", () => {
+        this._applyDiscovered();
+        this._render();
+      });
+    }
+
+    _escape(s) {
+      return String(s == null ? "" : s).replace(
+        /[&<>"']/g,
+        (c) =>
+          ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c])
+      );
+    }
+
     _render() {
       if (!this._config) return;
       this._rendered = true;
@@ -2215,6 +2581,18 @@
           .setup.ready { border-color: var(--primary-color); }
           .hint { font-size: 0.8rem; color: var(--secondary-text-color); }
           .status { font-size: 0.8rem; color: var(--primary-color); min-height: 1em; }
+          .discovery { display: flex; flex-direction: column; gap: 8px; }
+          .discovery .note { font-size: 0.82rem; color: var(--secondary-text-color); display: flex; align-items: center; gap: 6px; }
+          .discovery .note.found { color: var(--primary-color); }
+          .discovery ul.zone-preview { margin: 0; padding: 0 0 0 2px; list-style: none; display: flex; flex-direction: column; gap: 3px; }
+          .discovery ul.zone-preview li { font-size: 0.82rem; color: var(--primary-text-color); display: flex; gap: 8px; }
+          .discovery ul.zone-preview li .num { color: var(--secondary-text-color); min-width: 3.4em; }
+          .discovery ul.zone-preview li .eid { color: var(--secondary-text-color); font-size: 0.75rem; }
+          .use { border: 1px solid var(--primary-color); border-radius: 10px; background: var(--primary-color); color: var(--text-primary-color, #fff); padding: 12px; cursor: pointer; font-weight: 600; font-size: 0.9rem; width: 100%; }
+          .use:hover { filter: brightness(1.06); }
+          .use:disabled { opacity: 0.5; cursor: default; }
+          .replace { border: 1px solid var(--primary-color); border-radius: 10px; background: transparent; color: var(--primary-color); padding: 10px; cursor: pointer; font-weight: 600; font-size: 0.85rem; width: 100%; }
+          .replace:hover { background: rgba(var(--rgb-primary-color, 33,150,243), 0.06); }
           ha-expansion-panel { --expansion-panel-summary-padding: 0 8px; border: 1px solid var(--divider-color); border-radius: 10px; }
           .panel-body { display: flex; flex-direction: column; gap: 12px; padding: 4px 8px 12px; }
         </style>
@@ -2234,7 +2612,8 @@
           <ha-expansion-panel id="zones-panel" ${hasZone ? "" : "expanded"} outlined>
             <div slot="header">Zones in your system${zonesNeedingSetup ? ` · ${zonesNeedingSetup} need helpers` : ""}</div>
             <div class="panel-body">
-              <div class="section-sub">Tell the card how many physical valves/switches you have, then point each row at its entity. “Set up helpers” makes the timer, schedule and enable helpers for them and fills in the Advanced fields automatically.</div>
+              <div class="section-sub">Pick your irrigation device at the top and the card finds its zones for you. Or tell the card how many valves/switches you have and point each row at its entity. “Set up helpers” makes the timer, schedule and enable helpers and fills in the Advanced fields automatically.</div>
+              <div id="discovery"></div>
               <ha-form id="zone-count"></ha-form>
               <div id="zones"></div>
               <button class="setup ${zonesNeedingSetup ? "ready" : ""}" id="setup">
@@ -2283,7 +2662,15 @@
           skip_48h_number: v.skip_48h_number,
         };
         this._fire();
-        if (v.style !== prevStyle || v.device !== prevDevice) this._render();
+        const deviceChanged = v.device !== prevDevice;
+        if (v.style !== prevStyle || deviceChanged) this._render();
+        if (deviceChanged) {
+          // Re-run auto-discovery for the newly-picked device. Force so a
+          // re-pick of the same-then-different device always refreshes.
+          this._discovered = null;
+          this._registryDevice = null;
+          this._runDiscovery(true);
+        }
       });
 
       // ---- zone count: generates exactly N compact zone rows
@@ -2418,6 +2805,19 @@
       });
 
       this.shadowRoot.getElementById("setup")?.addEventListener("click", () => this._setupHelpers());
+
+      // ---- zone auto-discovery panel (async; patched in place)
+      this._renderDiscovery();
+      if (
+        this._config.device &&
+        this._hass &&
+        this._registryDevice !== this._config.device &&
+        !this._discovering
+      ) {
+        // A device is configured but we haven't discovered for it yet — do it
+        // now (won't clobber existing zones; it only populates the proposal).
+        this._runDiscovery();
+      }
     }
   }
 
