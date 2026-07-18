@@ -1,8 +1,40 @@
 /**
- * Irrigation Schedule Card v0.4.1
+ * Irrigation Schedule Card v0.4.2
  * https://github.com/mycrouch/irrigation-schedule-card
  * ----------------------------------------------------------------
  * A Lovelace card for weekly irrigation scheduling with rain smarts.
+ *
+ * Bug fixes (v0.4.2):
+ *  - LIVE SYNC BUG (Gavin): creating or editing a schedule in the EDITOR wrote
+ *    the new time into the card config but never regenerated the zone's native
+ *    `schedule` helper, so the dispatcher kept running the OLD blocks. Root
+ *    cause: the editor's schedule mutations (add / edit / delete / enable /
+ *    disable, plus zone add/remove) only set config and fired `config-changed`;
+ *    the helper-regeneration routine lived on the CARD class and inside the
+ *    editor's one-time `_setupHelpers`, and was never invoked on ordinary
+ *    editor edits. The card FACE did regenerate, but only the single mutated
+ *    zone. Both paths swallowed WebSocket errors to the console.
+ *    Fixes: (1) a single shared regeneration routine (`regenerateHelpers`) is
+ *    now run on EVERY schedule mutation from BOTH the editor and the card face;
+ *    it rewrites every zone's helper as the union of blocks from that zone's
+ *    ENABLED schedules (zones with none get all-empty days, clearing stale
+ *    blocks). WS write failures are surfaced to the user, never dropped.
+ *  - Legacy enable boolean sync: during regeneration each zone's
+ *    `input_boolean.irrigation_zone_N_schedule_enabled` (the per-zone gate the
+ *    dispatcher still reads) is set ON when the zone has >=1 enabled schedule,
+ *    OFF otherwise — only when the entity exists. The boolean stays consistent
+ *    with the card UI without being exposed anywhere in it.
+ *  - Drift detection: on load the card cheaply compares each zone helper's
+ *    blocks with what its enabled schedules imply. If they disagree it shows a
+ *    warning strip with a one-tap "Sync now" (admin), and the "Next run" line
+ *    notes when it is showing helper state that disagrees with the config.
+ *    An in-sync system (helper == config) shows nothing and writes nothing.
+ *  - Name derivation regression: a friendly name like "Holman - (Zone 3) Veggie
+ *    Pods" kept its "Holman - " prefix when the device name was unavailable at
+ *    discovery time (stored "Holman - Veggie Pods"). deriveZoneName now strips a
+ *    leading "brand + separator" prefix robustly, independent of the device
+ *    name, whenever it precedes a zone decoration — so
+ *    "Holman - (Zone 3) Veggie Pods" -> "Veggie Pods".
  *
  * Bug fixes (v0.4.1):
  *  - Discovery now INCLUDES hidden entities. A hidden (hidden_by "user") zone
@@ -104,7 +136,7 @@
 
   const CARD_TAG = "irrigation-schedule-card";
   const EDITOR_TAG = "irrigation-schedule-card-editor";
-  const VERSION = "0.4.1";
+  const VERSION = "0.4.2";
 
   const MAX_ZONES = 8;
   const MAX_SCHEDULES = 24;
@@ -220,6 +252,124 @@
   const newScheduleId = () =>
     `s${Date.now().toString(36)}${(SCHED_SEQ++).toString(36)}`;
 
+  /* ------------------------------------------- helper regeneration */
+  // The single source of truth for turning a zone's ENABLED config schedules
+  // into the weekly block set its native `schedule` helper should hold. Shared
+  // by the card face and the editor so config and helper can never drift. Pure
+  // and testable.
+  //
+  // Non-custom schedules contribute {from: start, to: start+minutes} on each of
+  // their days; a preserved "custom" schedule re-emits its raw helper blocks
+  // verbatim (rawHelper is that zone's current helper config). A zone with no
+  // enabled schedules yields all-empty days — which is what clears stale blocks
+  // off a zone that no longer has any schedules.
+  const buildZoneBlocks = (zoneEntity, schedules, rawHelper) => {
+    const dayBlocks = {};
+    DAYS.forEach((d) => (dayBlocks[d.key] = []));
+    (schedules || [])
+      .filter((s) => s && s.zone === zoneEntity && s.enabled !== false)
+      .forEach((s) => {
+        if (s.custom && rawHelper) {
+          DAYS.forEach((d) => {
+            (rawHelper[d.key] || []).forEach((b) =>
+              dayBlocks[d.key].push({ from: b.from, to: b.to })
+            );
+          });
+          return;
+        }
+        const startMin = timeToMin(s.start);
+        if (startMin == null) return;
+        const minutes = Number(s.minutes) > 0 ? Number(s.minutes) : DEFAULT_MINUTES;
+        let endMin = startMin + minutes;
+        if (endMin >= 1440) endMin = 1439; // clamp — no cross-midnight blocks
+        const from = `${minToTime(startMin)}:00`;
+        const to = `${minToTime(endMin)}:00`;
+        (s.days || []).forEach((di) => {
+          const key = DAYS[di]?.key;
+          if (key) dayBlocks[key].push({ from, to });
+        });
+      });
+    // Sort + dedupe each day's blocks so the helper is tidy and comparable.
+    DAYS.forEach((d) => {
+      const seen = new Set();
+      dayBlocks[d.key] = dayBlocks[d.key]
+        .filter((b) => {
+          const k = `${b.from}|${b.to}`;
+          if (seen.has(k)) return false;
+          seen.add(k);
+          return true;
+        })
+        .sort((a, b) => (a.from < b.from ? -1 : a.from > b.from ? 1 : 0));
+    });
+    return dayBlocks;
+  };
+
+  // Order-independent HH:MM signature of a day->blocks map, for cheap drift
+  // comparison between a helper's actual blocks and the config's desired blocks.
+  const zoneBlocksSignature = (dayBlocks) =>
+    DAYS.map((d) =>
+      (dayBlocks?.[d.key] || [])
+        .map((b) => `${String(b.from).slice(0, 5)}-${String(b.to).slice(0, 5)}`)
+        .sort()
+        .join(",")
+    ).join("|");
+
+  // Regenerate EVERY zone's helper as the union of its enabled schedules, and
+  // sync each zone's legacy enable boolean (ON iff the zone has >=1 enabled
+  // schedule, and only when the entity exists). Updates helperCache in place so
+  // callers' drift checks see the new blocks immediately. Returns a list of
+  // failures — callers MUST surface these; nothing is swallowed here.
+  const regenerateHelpers = async (hass, zones, schedules, helperCache) => {
+    const failures = [];
+    if (!hass?.callWS) return failures;
+    for (const z of zones || []) {
+      if (!z?.entity) continue;
+      // 1. the zone's schedule helper (union of enabled-schedule blocks)
+      if (z.schedule) {
+        const raw = helperCache ? helperCache[z.schedule] : null;
+        const dayBlocks = buildZoneBlocks(z.entity, schedules, raw);
+        const payload = {
+          type: "schedule/update",
+          schedule_id: objectId(z.schedule),
+        };
+        DAYS.forEach((d) => (payload[d.key] = dayBlocks[d.key]));
+        try {
+          await hass.callWS(payload);
+          if (helperCache) helperCache[z.schedule] = { ...payload };
+        } catch (e) {
+          failures.push({ zone: z.entity, target: z.schedule, error: e });
+        }
+      }
+      // 2. the legacy per-zone enable boolean (dispatcher gate), if it exists
+      if (z.enable && hass.states?.[z.enable]) {
+        const hasEnabled = (schedules || []).some(
+          (s) => s && s.zone === z.entity && s.enabled !== false
+        );
+        const want = hasEnabled ? "on" : "off";
+        if (hass.states[z.enable].state !== want) {
+          try {
+            await hass.callService(
+              "input_boolean",
+              hasEnabled ? "turn_on" : "turn_off",
+              { entity_id: z.enable }
+            );
+          } catch (e) {
+            failures.push({ zone: z.entity, target: z.enable, error: e });
+          }
+        }
+      }
+    }
+    return failures;
+  };
+
+  const failureMessage = (failures) => {
+    if (!failures || !failures.length) return "";
+    const f = failures[0];
+    const msg = f.error?.message || f.error?.error || String(f.error || "error");
+    const more = failures.length > 1 ? ` (+${failures.length - 1} more)` : "";
+    return `${msg}${more}`;
+  };
+
   /* ------------------------------------------------ zone discovery */
 
   // Zone-capable domains. switch/valve are the real thing; light/input_boolean
@@ -256,6 +406,11 @@
   // a fallback so a name is never lost.
   // e.g. deviceName "Holman Water System (Local)",
   //      friendly  "Holman - (Zone 1) Front Lawn"  ->  "Front Lawn".
+  // v0.4.2: also strips a leading "brand + separator" prefix independently of
+  //      the device name, so the Holman case works even when the device name is
+  //      unavailable at discovery time (the v0.4.1 regression that stored
+  //      "Holman - Veggie Pods"):
+  //      friendly  "Holman - (Zone 3) Veggie Pods"  ->  "Veggie Pods".
   const deriveZoneName = (friendlyName, deviceName) => {
     const original = String(friendlyName || "").trim();
     if (!original) return "";
@@ -278,6 +433,17 @@
         break;
       }
     }
+
+    // Device-name-independent fallback: strip a leading "brand + separator"
+    // token when it immediately precedes a zone decoration ("(Zone N)" / "Zone
+    // N"). This is the exact boilerplate shape these integrations emit, so it is
+    // safe — it only fires on "<word> - (Zone N) ..." and never on real names
+    // like "Front - Lawn". Fixes the case where the device name was absent above
+    // and "Holman - " survived (-> stored "Holman - Veggie Pods").
+    s = s.replace(
+      /^\s*[^-:·|/()]+?\s*[-:·|/]\s*(?=\(?\s*zone\b)/i,
+      ""
+    );
 
     // Strip zone-number decorations anywhere: "(Zone 1)", "Zone 1", "Zone-1",
     // and leftover bracket punctuation.
@@ -363,7 +529,8 @@
       this._appliedThemeProps = [];
       this._expanded = new Set(); // schedule ids currently expanded
       this._creating = new Set(); // entity ids mid-create
-      this._syncing = new Set(); // zone entity ids mid-sync
+      this._syncingAll = false; // regeneration in flight
+      this._syncError = null; // last WS regeneration failure (surfaced to user)
     }
 
     static getConfigElement() {
@@ -480,6 +647,14 @@
 
     _isAdmin() {
       return !!this._hass?.user?.is_admin;
+    }
+
+    _escapeHtml(s) {
+      return String(s == null ? "" : s).replace(
+        /[&<>"']/g,
+        (c) =>
+          ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c])
+      );
     }
 
     getCardSize() {
@@ -791,7 +966,7 @@
         patch.customSummary = "";
       }
       this._updateSchedule(id, patch);
-      this._syncZoneFor(id);
+      this._syncAllZones();
     }
 
     _setStart(id, start) {
@@ -803,7 +978,7 @@
         patch.customSummary = "";
       }
       this._updateSchedule(id, patch);
-      this._syncZoneFor(id);
+      this._syncAllZones();
     }
 
     _bumpMinutes(id, delta) {
@@ -817,14 +992,14 @@
         patch.customSummary = "";
       }
       this._updateSchedule(id, patch);
-      this._syncZoneFor(id);
+      this._syncAllZones();
     }
 
     _toggleScheduleEnabled(id) {
       const s = this._sched(id);
       if (!s) return;
       this._updateSchedule(id, { enabled: !s.enabled });
-      this._syncZoneFor(id);
+      this._syncAllZones();
     }
 
     _toggleExpand(id) {
@@ -836,72 +1011,61 @@
 
     /* ------------------------------------------------ helper sync */
 
-    _syncZoneFor(scheduleId) {
-      const s = this._sched(scheduleId);
-      if (!s) return;
-      this._syncZone(s.zone);
+    // Regenerate EVERY zone's helper (and legacy enable boolean) from the
+    // current config after any schedule mutation — add / edit / delete /
+    // enable / disable. This is the single sync path shared with the editor
+    // (`regenerateHelpers`); config is the source of truth, the helper is the
+    // derived cache. Rewriting all zones (not just the mutated one) also clears
+    // stale blocks off zones that no longer have any enabled schedules. WS
+    // failures are surfaced on the card face, never silently dropped.
+    async _syncAllZones() {
+      if (!this._hass || this._syncingAll) return;
+      this._syncingAll = true;
+      try {
+        const failures = await regenerateHelpers(
+          this._hass,
+          this._zones(),
+          this._effectiveSchedules().map((s) => this._normSchedule(s)),
+          this._helperBlocks
+        );
+        this._syncError = failures.length ? failureMessage(failures) : null;
+        if (failures.length) {
+          console.error(`${CARD_TAG}: helper regeneration failed`, failures);
+        }
+      } finally {
+        this._syncingAll = false;
+        this._stateKey = "";
+        this._render();
+      }
     }
 
-    // Regenerate a zone's native schedule helper as the union of the blocks
-    // from every ENABLED, non-custom schedule bound to that zone. Custom
-    // schedules are preserved verbatim (their raw helper blocks are re-emitted
-    // untouched). This is the single sync path — config drives helper.
-    async _syncZone(zoneEntity) {
-      if (!zoneEntity || !this._hass || this._syncing.has(zoneEntity)) return;
-      const zone = this._zones().find((z) => z.entity === zoneEntity);
-      if (!zone?.schedule) return;
-      this._syncing.add(zoneEntity);
-      try {
-        // Start from any preserved custom blocks so we never lose them.
-        const dayBlocks = {};
-        DAYS.forEach((d) => (dayBlocks[d.key] = []));
-        const raw = this._helperBlocks[zone.schedule];
-        this._effectiveSchedules()
-          .filter((s) => s.zone === zoneEntity)
-          .forEach((s) => {
-            const n = this._normSchedule(s);
-            if (!n.enabled) return;
-            if (n.custom && raw) {
-              DAYS.forEach((d) => {
-                (raw[d.key] || []).forEach((b) => dayBlocks[d.key].push(b));
-              });
-              return;
-            }
-            const startMin = timeToMin(n.start);
-            if (startMin == null) return;
-            let endMin = startMin + n.minutes;
-            if (endMin >= 1440) endMin = 1439; // clamp, no cross-midnight
-            const from = `${minToTime(startMin)}:00`;
-            const to = `${minToTime(endMin)}:00`;
-            n.days.forEach((di) => {
-              const key = DAYS[di]?.key;
-              if (key) dayBlocks[key].push({ from, to });
-            });
-          });
-        // Sort + dedupe each day's blocks so the helper is tidy.
-        DAYS.forEach((d) => {
-          const seen = new Set();
-          dayBlocks[d.key] = dayBlocks[d.key]
-            .filter((b) => {
-              const k = `${b.from}|${b.to}`;
-              if (seen.has(k)) return false;
-              seen.add(k);
-              return true;
-            })
-            .sort((a, b) => (a.from < b.from ? -1 : a.from > b.from ? 1 : 0));
-        });
-        const payload = {
-          type: "schedule/update",
-          schedule_id: objectId(zone.schedule),
-        };
-        DAYS.forEach((d) => (payload[d.key] = dayBlocks[d.key]));
-        await this._hass.callWS(payload);
-        this._helperBlocks[zone.schedule] = { ...payload };
-      } catch (e) {
-        console.error(`${CARD_TAG}: zone sync failed for ${zoneEntity}`, e);
-      } finally {
-        this._syncing.delete(zoneEntity);
-      }
+    // The blocks a zone helper SHOULD hold, given the config's enabled
+    // schedules (custom schedules preserved from the loaded raw helper).
+    _desiredZoneBlocks(zone) {
+      const raw = this._helperBlocks[zone.schedule] || null;
+      return buildZoneBlocks(
+        zone.entity,
+        this._effectiveSchedules().map((s) => this._normSchedule(s)),
+        raw
+      );
+    }
+
+    // Zones whose loaded helper blocks disagree with the config's enabled
+    // schedules. Cheap and read-only — used for the drift warning and to flag
+    // a stale "Next run". Only assessed once helpers have loaded, so a
+    // not-yet-loaded helper never reads as false drift.
+    _driftingZones() {
+      if (!this._loadedSchedules) return [];
+      const out = [];
+      this._zones().forEach((z) => {
+        if (!z?.entity || !z.schedule) return;
+        const raw = this._helperBlocks[z.schedule];
+        if (raw === undefined) return; // helper not loaded — don't guess
+        const desired = zoneBlocksSignature(this._desiredZoneBlocks(z));
+        const actual = zoneBlocksSignature(raw || {});
+        if (desired !== actual) out.push(z);
+      });
+      return out;
     }
 
     /* ------------------------------------------------ control actions */
@@ -1048,6 +1212,7 @@
     // the schedule name, not "Zone N".
     _nextRun() {
       let best = null;
+      const drifting = new Set(this._driftingZones().map((z) => z.entity));
       this._zones().forEach((z, idx) => {
         const s = this._hass?.states?.[z.schedule];
         if (!s) return;
@@ -1062,7 +1227,9 @@
         );
         if (!enabledHere) return;
         const name = this._nameForRunAt(z.entity, when) || this._zoneLabel(z, idx);
-        if (!best || when < best.when) best = { when, name };
+        // stale: the next_event comes from a helper whose blocks disagree with
+        // the config, so the time shown may not be what the schedule says.
+        if (!best || when < best.when) best = { when, name, stale: drifting.has(z.entity) };
       });
       return best;
     }
@@ -1257,6 +1424,38 @@
       const next = this._nextRun();
       const rain = this._rainStatus();
 
+      // Drift / sync-failure warning strip. Shown only when a zone helper's
+      // blocks disagree with the config's enabled schedules, or the last
+      // regeneration failed. An in-sync system shows nothing.
+      const drift = this._driftingZones();
+      let syncStrip = "";
+      if (this._syncError) {
+        syncStrip = `
+          <div class="sync-strip err">
+            <ha-icon icon="mdi:cloud-alert"></ha-icon>
+            <span>Couldn't update the zone schedule in Home Assistant (${this._escapeHtml(
+              this._syncError
+            )}). Your change is saved — ${
+          admin ? "tap Sync now to retry." : "ask an admin to sync."
+        }</span>
+            ${admin ? `<button class="sync-now" id="sync-now">Sync now</button>` : ""}
+          </div>`;
+      } else if (drift.length) {
+        const names = drift
+          .map((z) => this._zoneLabel(z, this._zones().indexOf(z)))
+          .join(", ");
+        syncStrip = `
+          <div class="sync-strip">
+            <ha-icon icon="mdi:sync-alert"></ha-icon>
+            <span>${
+              drift.length === 1 ? "A zone's" : "Some zones'"
+            } saved schedule doesn't match Home Assistant's helper (${this._escapeHtml(
+          names
+        )}). ${admin ? "Tap Sync now to bring them in line." : "Ask an admin to sync."}</span>
+            ${admin ? `<button class="sync-now" id="sync-now">Sync now</button>` : ""}
+          </div>`;
+      }
+
       let statusIcon = "mdi:calendar-clock";
       let statusText;
       let statusClass = "";
@@ -1277,6 +1476,11 @@
         statusClass = "warn";
       } else if (next) {
         statusText = `Next run: ${next.name} · ${this._dayLabel(next.when)}`;
+        if (next.stale) {
+          statusText += " · from an out-of-sync helper";
+          statusClass = "warn";
+          statusIcon = "mdi:calendar-alert";
+        }
       } else {
         statusIcon = "mdi:calendar-blank";
         const hasZones = (c.zones || []).some((z) => z?.entity);
@@ -1314,6 +1518,8 @@
             <ha-icon icon="${statusIcon}"></ha-icon>
             <span>${statusText}</span>
           </div>
+
+          ${syncStrip}
 
           ${
             rain
@@ -1470,6 +1676,10 @@
       root.getElementById("clear-delay")?.addEventListener("click", () =>
         this._clearDelay()
       );
+      root.getElementById("sync-now")?.addEventListener("click", (ev) => {
+        ev.stopPropagation();
+        this._syncAllZones();
+      });
 
       root.querySelectorAll("[data-create]").forEach((b) =>
         b.addEventListener("click", (ev) => {
@@ -1591,6 +1801,26 @@
     .status.warn ha-icon { color: var(--warning-color, #ff9800); }
     .status.muted { background: rgba(127,127,127,0.10); }
     .status.muted ha-icon { color: var(--secondary-text-color); }
+
+    .sync-strip {
+      display: flex; align-items: center; gap: 8px;
+      margin: 0 16px 10px; padding: 9px 12px; border-radius: 10px;
+      background: rgba(255,152,0,0.14); color: var(--primary-text-color);
+      font-size: 0.85rem; font-weight: 500;
+    }
+    .sync-strip ha-icon { --mdc-icon-size: 20px; flex-shrink: 0; color: var(--warning-color, #ff9800); }
+    .sync-strip.err { background: rgba(244,67,54,0.14); }
+    .sync-strip.err ha-icon { color: var(--error-color, #f44336); }
+    .sync-strip span { flex: 1; min-width: 0; }
+    .sync-now {
+      flex-shrink: 0; border: 1px solid var(--warning-color, #ff9800);
+      border-radius: 999px; background: transparent;
+      color: var(--warning-color, #ff9800); cursor: pointer;
+      padding: 5px 12px; font-size: 0.78rem; font-weight: 700;
+    }
+    .sync-now:hover { background: rgba(255,152,0,0.16); }
+    .sync-strip.err .sync-now { border-color: var(--error-color, #f44336); color: var(--error-color, #f44336); }
+    .sync-strip.err .sync-now:hover { background: rgba(244,67,54,0.16); }
 
     .controls {
       margin-top: 6px; padding-top: 10px;
@@ -1762,6 +1992,8 @@
       this._registryDevice = null; // device id the last discovery ran for
       this._discovered = null; // last discovered zone list (proposal)
       this._discovering = false;
+      this._regenError = null; // last helper-regeneration failure (surfaced)
+      this._regenTimer = null; // debounce for editor-side regeneration
     }
 
     connectedCallback() {
@@ -2166,6 +2398,62 @@
 
     _fire() {
       fireEvent(this, "config-changed", { config: this._config });
+    }
+
+    // v0.4.2: after ANY schedule mutation in the editor, regenerate the zone
+    // helpers server-side — the fix for the live-sync bug where editor edits
+    // updated the config but never the native `schedule` helper. Debounced so a
+    // burst of value-changed events (e.g. typing a name) coalesces into one
+    // regeneration. Only zones that have a schedule helper are written.
+    _scheduleRegenerate() {
+      if (this._regenTimer) clearTimeout(this._regenTimer);
+      this._regenTimer = setTimeout(() => {
+        this._regenTimer = null;
+        this._regenerateHelpers();
+      }, 500);
+    }
+
+    async _regenerateHelpers() {
+      const hass = this._hass;
+      if (!hass?.callWS) return;
+      const wired = (this._config.zones || []).filter((z) => z?.entity && z.schedule);
+      if (!wired.length) return; // nothing to sync until helpers exist
+      try {
+        // Load the current helper blocks so custom schedules are preserved.
+        const list = await hass.callWS({ type: "schedule/list" });
+        const byId = {};
+        (list || []).forEach((s) => (byId[`schedule.${s.id}`] = s));
+        const cache = {};
+        (this._config.zones || []).forEach((z) => {
+          if (z?.schedule) cache[z.schedule] = byId[z.schedule] || null;
+        });
+        const failures = await regenerateHelpers(
+          hass,
+          this._config.zones,
+          this._config.schedules || [],
+          cache
+        );
+        this._regenError = failures.length ? failureMessage(failures) : null;
+        this._showRegenStatus(
+          failures.length
+            ? `Couldn't sync Home Assistant helpers: ${this._regenError}. The schedule is saved — re-run “Set up helpers”, or open the card face and tap Sync now (admin required).`
+            : "",
+          failures.length > 0
+        );
+      } catch (e) {
+        this._regenError = e?.message || e?.error || String(e);
+        this._showRegenStatus(
+          `Couldn't sync Home Assistant helpers: ${this._regenError}.`,
+          true
+        );
+      }
+    }
+
+    _showRegenStatus(text, isErr) {
+      const el = this.shadowRoot?.getElementById("regen-status");
+      if (!el) return;
+      el.textContent = text || "";
+      el.className = `status${isErr ? " err" : ""}`;
     }
 
     _slug(text) {
@@ -2782,6 +3070,7 @@
           .setup.ready { border-color: var(--primary-color); }
           .hint { font-size: 0.8rem; color: var(--secondary-text-color); }
           .status { font-size: 0.8rem; color: var(--primary-color); min-height: 1em; }
+          .status.err { color: var(--error-color, #db4437); }
           .discovery { display: flex; flex-direction: column; gap: 8px; }
           .discovery .note { font-size: 0.82rem; color: var(--secondary-text-color); display: flex; align-items: center; gap: 6px; }
           .discovery .note.found { color: var(--primary-color); }
@@ -2811,6 +3100,8 @@
               : `<button class="add" id="add-schedule" disabled>＋ Add schedule</button>
                  <div class="hint">Define your zones first — open “Zones in your system” below.</div>`
           }
+          <div class="status${this._regenError ? " err" : ""}" id="regen-status">${this._regenError ? this._escape(`Couldn't sync Home Assistant helpers: ${this._regenError}.`) : ""}</div>
+          <div class="hint">Adding or editing a schedule here also regenerates that zone's Home Assistant helper (the union of its enabled schedules), so the card face and the dispatcher always agree.</div>
 
           <ha-expansion-panel id="zones-panel" ${hasZone ? "" : "expanded"} outlined>
             <div slot="header">Zones in your system${zonesNeedingSetup ? ` · ${zonesNeedingSetup} need helpers` : ""}</div>
@@ -2902,6 +3193,7 @@
         this._config = { ...this._config, zones: newZones, schedules: newSchedules };
         this._fire();
         this._render();
+        this._scheduleRegenerate();
       });
 
       // ---- zones list (one compact row per zone)
@@ -2930,6 +3222,7 @@
           newZones[idx] = flat;
           this._config = { ...this._config, zones: newZones };
           this._fire();
+          this._scheduleRegenerate();
         });
         row.appendChild(form);
         const del = document.createElement("button");
@@ -2946,6 +3239,7 @@
           this._config = { ...this._config, zones: newZones, schedules: newSchedules };
           this._fire();
           this._render();
+          this._scheduleRegenerate();
         });
         row.appendChild(del);
         zonesEl.appendChild(row);
@@ -2973,6 +3267,7 @@
           newSchedules[idx] = this._scheduleFromData(newSchedules[idx] || {}, ev.detail.value);
           this._config = { ...this._config, schedules: newSchedules };
           this._fire();
+          this._scheduleRegenerate();
         });
         box.appendChild(form);
         box.querySelector(".del").addEventListener("click", () => {
@@ -2980,6 +3275,7 @@
           this._config = { ...this._config, schedules: newSchedules };
           this._fire();
           this._render();
+          this._scheduleRegenerate();
         });
         schedEl.appendChild(box);
       });
@@ -3005,6 +3301,7 @@
         this._config = { ...this._config, schedules: newSchedules };
         this._fire();
         this._render();
+        this._scheduleRegenerate();
       });
 
       this.shadowRoot.getElementById("setup")?.addEventListener("click", () => this._setupHelpers());

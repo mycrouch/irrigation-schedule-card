@@ -32,6 +32,13 @@ The card never runs a timer in the browser. Setup creates:
 4. **Shared safety automations** — turn a zone off when its timer ends, and cancel a zone's timer if the zone is switched off elsewhere. These are shared with `manual-irrigation-zone-card`.
 5. **A daily rainfall utility meter + a 48 h template sensor** — the utility meter tracks today's rain from your "precipitation today" sensor; the template sensor sums today + yesterday for the rolling 48 h figure used by the skip logic.
 
+## Config is the source of truth — helpers stay in sync automatically
+
+Your **schedules are the source of truth**. They live in the card config (saved back to the Lovelace config), and each zone's native `schedule` helper is a **derived cache** that the dispatcher automation reads. You never edit the helper directly — the card keeps it in sync for you.
+
+- **Every schedule change regenerates the helpers.** Adding, editing, deleting, enabling or disabling a schedule — from **either the editor or the card face** — rewrites every zone's helper as the union of the blocks from that zone's *enabled* schedules. A zone with no enabled schedules is written empty, so stale blocks never linger. Each zone's legacy per-zone enable boolean (`input_boolean.irrigation_zone_N_schedule_enabled`, the gate the dispatcher still reads) is set on/off to match at the same time, so it can never silently veto a run you've set up. If a write to Home Assistant fails, the card **tells you** rather than dropping it quietly.
+- **Drift warning + Sync now.** On load the card cheaply compares each zone's helper against what its enabled schedules imply. If they disagree — for example a helper was edited by hand in Settings → Helpers, or an older card version left it out of step — a warning strip appears with a one-tap **Sync now** (admin) that rewrites the helpers to match the config. The **Next run** line also flags when the time it is showing comes from a helper that disagrees with your schedules. When everything matches (the normal case) nothing is shown and nothing is written.
+
 ## How the rain smarts work
 
 The card watches the weather so it doesn't water a wet garden, using **two independent thresholds** plus a manual delay. You set both thresholds in the editor's **Rain smarts** section, where each field shows its current live reading so you can sanity-check it.
