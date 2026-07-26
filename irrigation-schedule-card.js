@@ -136,7 +136,7 @@
 
   const CARD_TAG = "irrigation-schedule-card";
   const EDITOR_TAG = "irrigation-schedule-card-editor";
-  const VERSION = "0.4.2";
+  const VERSION = "0.4.3";
 
   const MAX_ZONES = 8;
   const MAX_SCHEDULES = 24;
@@ -2939,7 +2939,10 @@
         description: "Created by irrigation-schedule-card (shared with manual-irrigation-zone-card).",
         mode: "parallel",
         max: MAX_ZONES,
-        trigger: [{ platform: "state", entity_id: Object.keys(timerMap), to: "off" }],
+        // for: "00:00:02" debounces the Holman switch's power-on bounce (~10ms off-blip when a
+        // zone energises) so it cannot cancel a freshly-started timer. A real manual stop holds
+        // off for >2s and still cancels cleanly. Fixes first-run-fails / stop-button-drops-off.
+        trigger: [{ platform: "state", entity_id: Object.keys(timerMap), to: "off", for: "00:00:02" }],
         variables: { timer_map: timerMap },
         condition: [{ condition: "template", value_template: "{{ states(timer_map[trigger.entity_id]) == 'active' }}" }],
         action: [{ service: "timer.cancel", target: { entity_id: "{{ timer_map[trigger.entity_id] }}" } }],
