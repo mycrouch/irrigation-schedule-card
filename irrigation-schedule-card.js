@@ -1,8 +1,38 @@
 /**
- * Irrigation Schedule Card v0.4.2
+ * Irrigation Schedule Card v0.4.4
  * https://github.com/mycrouch/irrigation-schedule-card
  * ----------------------------------------------------------------
  * A Lovelace card for weekly irrigation scheduling with rain smarts.
+ *
+ * Bug fixes (v0.4.4):
+ *  - HELPER WRITES ALWAYS FAILED (Gavin, root cause of the stuck "Sync now"
+ *    warning, the schedule reading "Off" and "No upcoming runs"). Home
+ *    Assistant's `schedule/update` WebSocket command validates the message
+ *    against BASE_SCHEMA | STORAGE_SCHEDULE_SCHEMA, and BASE_SCHEMA marks
+ *    `name` REQUIRED (core/homeassistant/components/schedule/__init__.py).
+ *    The card sent only `schedule_id` + the seven day arrays, so EVERY
+ *    regeneration was rejected before it reached the collection and the zone
+ *    helper was never rewritten. Consequences on Gavin's system: disabling
+ *    "Veggie Pods Mornings" on the card face set the config flag and the
+ *    per-zone enable boolean, but left the helper holding Mon/Wed/Fri
+ *    08:00–08:05 — so the card (correctly) rendered the schedule as off with
+ *    no upcoming runs, while the drift check (also correctly) reported the
+ *    helper as out of step. "Sync now" re-issued the same invalid call and
+ *    could never clear it. Fix: send `name` (and preserve `icon`) on every
+ *    `schedule/update`, sourced from the loaded helper, else the entity's
+ *    friendly name, else a title-cased object id — never blank.
+ *  - Regeneration is now a no-op when a zone helper already matches its
+ *    config: signatures are compared first and the write is skipped. Nothing
+ *    is rewritten (and nothing can be clobbered) unless it genuinely differs.
+ *  - Drift comparison normalises time formats on both sides ("8:00",
+ *    "08:00", "08:00:00" and "24:00:00" all compare equal), so a helper
+ *    written by Home Assistant's own editor can never read as false drift.
+ *  - The header banner said v0.4.2 while VERSION said 0.4.3; both now agree.
+ *
+ * Bug fixes (v0.4.3):
+ *  - Generated "cancel timer if zone turned off externally" automation adds a
+ *    2 s debounce, so the Holman switch's ~10 ms off blip at power-on no
+ *    longer cancels the timer it just started.
  *
  * Bug fixes (v0.4.2):
  *  - LIVE SYNC BUG (Gavin): creating or editing a schedule in the EDITOR wrote
@@ -136,7 +166,7 @@
 
   const CARD_TAG = "irrigation-schedule-card";
   const EDITOR_TAG = "irrigation-schedule-card-editor";
-  const VERSION = "0.4.3";
+  const VERSION = "0.4.4";
 
   const MAX_ZONES = 8;
   const MAX_SCHEDULES = 24;
@@ -304,12 +334,28 @@
     return dayBlocks;
   };
 
+  // Normalise a time to zero-padded HH:MM for comparison. Home Assistant hands
+  // back "08:00:00" from schedule/list while the card config stores "08:00",
+  // and a hand-edited helper may hold "8:00" — all three must compare equal.
+  // "24:00" / "24:00:00" (HA's end-of-day marker) normalises to "24:00".
+  const normHM = (t) => {
+    if (t == null) return "";
+    const p = String(t).trim().split(":");
+    if (p.length < 2) return String(t).trim();
+    const h = Number(p[0]);
+    const m = Number(p[1]);
+    if (Number.isNaN(h) || Number.isNaN(m)) return String(t).trim();
+    return `${pad2(h)}:${pad2(m)}`;
+  };
+
   // Order-independent HH:MM signature of a day->blocks map, for cheap drift
   // comparison between a helper's actual blocks and the config's desired blocks.
+  // Both sides are normalised first so a seconds-bearing helper never reads as
+  // drift against a seconds-less config.
   const zoneBlocksSignature = (dayBlocks) =>
     DAYS.map((d) =>
       (dayBlocks?.[d.key] || [])
-        .map((b) => `${String(b.from).slice(0, 5)}-${String(b.to).slice(0, 5)}`)
+        .map((b) => `${normHM(b?.from)}-${normHM(b?.to)}`)
         .sort()
         .join(",")
     ).join("|");
@@ -325,17 +371,46 @@
     for (const z of zones || []) {
       if (!z?.entity) continue;
       // 1. the zone's schedule helper (union of enabled-schedule blocks)
-      if (z.schedule) {
-        const raw = helperCache ? helperCache[z.schedule] : null;
-        const dayBlocks = buildZoneBlocks(z.entity, schedules, raw);
+      // Skip the write when the helper already says exactly this. Keeps an
+      // in-sync system read-only, and means a false drift reading (if one ever
+      // occurs) can never clobber good helper blocks. The enable boolean below
+      // is still synced either way.
+      const rawHelper = z.schedule && helperCache ? helperCache[z.schedule] : null;
+      const wantBlocks = z.schedule
+        ? buildZoneBlocks(z.entity, schedules, rawHelper)
+        : null;
+      const inSync =
+        !!rawHelper &&
+        zoneBlocksSignature(rawHelper) === zoneBlocksSignature(wantBlocks);
+      if (z.schedule && !inSync) {
+        const raw = rawHelper;
+        const dayBlocks = wantBlocks;
+        // `name` is REQUIRED by HA's schedule/update command schema
+        // (BASE_SCHEMA in components/schedule/__init__.py). Omitting it made
+        // every regeneration fail message validation, so the helper was never
+        // rewritten. Keep the helper's own name and icon.
+        const stateObj = hass.states?.[z.schedule];
+        const name =
+          raw?.name ||
+          stateObj?.attributes?.friendly_name ||
+          titleize(objectId(z.schedule)) ||
+          "Schedule";
+        const icon = raw?.icon || stateObj?.attributes?.icon;
         const payload = {
           type: "schedule/update",
           schedule_id: objectId(z.schedule),
+          name,
         };
+        if (icon) payload.icon = icon;
         DAYS.forEach((d) => (payload[d.key] = dayBlocks[d.key]));
         try {
           await hass.callWS(payload);
-          if (helperCache) helperCache[z.schedule] = { ...payload };
+          if (helperCache) {
+            const cached = { name };
+            if (icon) cached.icon = icon;
+            DAYS.forEach((d) => (cached[d.key] = dayBlocks[d.key]));
+            helperCache[z.schedule] = cached;
+          }
         } catch (e) {
           failures.push({ zone: z.entity, target: z.schedule, error: e });
         }
