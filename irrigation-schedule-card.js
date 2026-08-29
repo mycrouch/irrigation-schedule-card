@@ -166,7 +166,7 @@
 
   const CARD_TAG = "irrigation-schedule-card";
   const EDITOR_TAG = "irrigation-schedule-card-editor";
-  const VERSION = "0.4.5";
+  const VERSION = "0.4.6";
 
   const MAX_ZONES = 8;
   /* Escape freeform text before it goes into innerHTML: card and schedule
@@ -271,7 +271,7 @@
       new CustomEvent(type, { detail, bubbles: true, composed: true })
     );
 
-  const objectId = (entityId) => (entityId || "").split(".").slice(1).join(".");
+  const objectId = (entityId) => String(entityId ?? "").split(".").slice(1).join(".");
 
   // linear RGB interpolation, per the shared palette helper
   const mixHex = (a, b, t) => {
@@ -1331,7 +1331,7 @@
           s.enabled !== false &&
           (s.days || []).includes(di)
       );
-      const exact = candidates.find((s) => (s.start || "").slice(0, 5) === hhmm);
+      const exact = candidates.find((s) => String(s.start ?? "").slice(0, 5) === hhmm);
       return (exact || candidates[0])?.name || null;
     }
 
