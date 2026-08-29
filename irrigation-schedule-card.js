@@ -166,9 +166,20 @@
 
   const CARD_TAG = "irrigation-schedule-card";
   const EDITOR_TAG = "irrigation-schedule-card-editor";
-  const VERSION = "0.4.4";
+  const VERSION = "0.4.5";
 
   const MAX_ZONES = 8;
+  /* Escape freeform text before it goes into innerHTML: card and schedule
+     names, zone names and icons from the config, summaries derived from the
+     HA schedule helper, and status text built from those names. */
+  const esc = (v) =>
+    String(v ?? "")
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;")
+      .replace(/'/g, "&#39;");
+
   const MAX_SCHEDULES = 24;
   const DEFAULT_MINUTES = 15;
   const DEFAULT_START = "05:00";
@@ -1574,11 +1585,11 @@
         <ha-card style="${hostVars}">
           <div class="header">
             <ha-icon class="header-icon" icon="mdi:sprinkler-variant"></ha-icon>
-            <div class="title">${c.title || "Irrigation Schedule"}</div>
+            <div class="title">${esc(c.title || "Irrigation Schedule")}</div>
             ${
               globalMissing
                 ? admin
-                  ? `<button class="pill-create" data-create="${c.global_enable}" title="Create the missing master switch helper">
+                  ? `<button class="pill-create" data-create="${esc(c.global_enable)}" title="Create the missing master switch helper">
                        <ha-icon icon="mdi:plus"></ha-icon>Create
                      </button>`
                   : ""
@@ -1591,7 +1602,7 @@
 
           <div class="status ${statusClass}">
             <ha-icon icon="${statusIcon}"></ha-icon>
-            <span>${statusText}</span>
+            <span>${esc(statusText)}</span>
           </div>
 
           ${syncStrip}
@@ -1599,8 +1610,8 @@
           ${
             rain
               ? `<div class="rain-status ${rain.cls}">
-                   <ha-icon icon="${rain.icon}"></ha-icon>
-                   <span>${rain.text}</span>
+                   <ha-icon icon="${esc(rain.icon)}"></ha-icon>
+                   <span>${esc(rain.text)}</span>
                  </div>`
               : ""
           }
@@ -1656,7 +1667,7 @@
           <div class="sched missing">
             <div class="icon-wrap warn"><ha-icon icon="mdi:alert-circle-outline"></ha-icon></div>
             <div class="sinfo">
-              <div class="sname">${s.name}</div>
+              <div class="sname">${esc(s.name)}</div>
               <div class="ssub">No zone assigned — open the editor and pick a zone.</div>
             </div>
           </div>`;
@@ -1666,8 +1677,8 @@
           <div class="sched missing">
             <div class="icon-wrap warn"><ha-icon icon="mdi:alert-circle-outline"></ha-icon></div>
             <div class="sinfo">
-              <div class="sname">${s.name}</div>
-              <div class="ssub">Zone entity not found: ${i.zone.entity || "(none set)"}</div>
+              <div class="sname">${esc(s.name)}</div>
+              <div class="ssub">Zone entity not found: ${esc(i.zone.entity || "(none set)")}</div>
             </div>
           </div>`;
       }
@@ -1700,13 +1711,13 @@
             }
             <div class="zone-line">
               <ha-icon icon="mdi:water"></ha-icon>
-              <span>Waters <strong>${i.zoneName}</strong></span>
+              <span>Waters <strong>${esc(i.zoneName)}</strong></span>
             </div>
             <div class="days">${chips}</div>
             <div class="sctl">
               <label class="time">
                 <ha-icon icon="mdi:clock-outline"></ha-icon>
-                <input type="time" value="${s.start}" data-time="${id}" />
+                <input type="time" value="${esc(s.start)}" data-time="${id}" />
               </label>
               <div class="stepper">
                 <button class="step minus" data-mins="${id}" data-dir="-1">−</button>
@@ -1721,11 +1732,11 @@
         <div class="sched ${i.running ? "running" : ""} ${i.enabled ? "" : "disabled"} ${expanded ? "expanded" : ""}">
           <div class="shead" data-expand="${id}">
             <div class="icon-wrap ${i.running ? "active" : ""}">
-              <ha-icon icon="${i.icon}"></ha-icon>
+              <ha-icon icon="${esc(i.icon)}"></ha-icon>
             </div>
             <div class="sinfo">
-              <div class="sname">${s.name}</div>
-              <div class="ssub ${i.running ? "running" : ""} ${s.custom ? "custom" : ""}">${summary}</div>
+              <div class="sname">${esc(s.name)}</div>
+              <div class="ssub ${i.running ? "running" : ""} ${s.custom ? "custom" : ""}">${esc(summary)}</div>
             </div>
             ${headCtl}
             <ha-icon class="chevron" icon="${expanded ? "mdi:chevron-up" : "mdi:chevron-down"}"></ha-icon>
@@ -3332,7 +3343,7 @@
         const box = document.createElement("div");
         box.className = "box";
         const nm = sched.name || `Schedule ${idx + 1}`;
-        box.innerHTML = `<div class="box-head"><span>${nm}</span><button class="del" title="Delete schedule">✕</button></div>`;
+        box.innerHTML = `<div class="box-head"><span>${esc(nm)}</span><button class="del" title="Delete schedule">✕</button></div>`;
         const form = document.createElement("ha-form");
         form.hass = this._hass;
         form.schema = this._scheduleSchema();
@@ -3409,14 +3420,16 @@
   }
 
   window.customCards = window.customCards || [];
-  window.customCards.push({
-    type: CARD_TAG,
-    name: "Irrigation Schedule Card",
-    description:
-      "Schedule-centric weekly irrigation planner with rain smarts — schedules are the first-class object (name, zone, days, time, duration, enable), the same zone can appear in several, plain-language summaries, rain-delay and skip controls, and one-click server-side setup.",
-    preview: true,
-    documentationURL: "https://github.com/mycrouch/irrigation-schedule-card",
-  });
+  if (!window.customCards.some((c) => c.type === CARD_TAG)) {
+    window.customCards.push({
+      type: CARD_TAG,
+      name: "Irrigation Schedule Card",
+      description:
+        "Schedule-centric weekly irrigation planner with rain smarts — schedules are the first-class object (name, zone, days, time, duration, enable), the same zone can appear in several, plain-language summaries, rain-delay and skip controls, and one-click server-side setup.",
+      preview: true,
+      documentationURL: "https://github.com/mycrouch/irrigation-schedule-card",
+    });
+  }
 
   console.info(
     `%c IRRIGATION-SCHEDULE-CARD %c v${VERSION} `,
