@@ -1,8 +1,23 @@
 /**
- * Irrigation Schedule Card v0.4.4
+ * Irrigation Schedule Card v0.5.0
  * https://github.com/mycrouch/irrigation-schedule-card
  * ----------------------------------------------------------------
  * A Lovelace card for weekly irrigation scheduling with rain smarts.
+ *
+ * Changes (v0.5.0, HACS review):
+ *  - The card face no longer writes the dashboard. Pre-0.5.0 every face edit
+ *    (day chip, start time, duration, enable) fetched the whole Lovelace
+ *    dashboard, patched matching cards and saved it back over WS, which could
+ *    overwrite concurrent dashboard changes. The face is now read-only for
+ *    schedule definitions; edits happen in the card editor, persisted through
+ *    config-changed. Master switch, skip-next and rain delay stay on the face
+ *    (they are helpers, not dashboard config).
+ *  - Setup only updates automations the card owns (AUTOMATION_MARKER in the
+ *    description). A user's own automation with the same alias is never
+ *    matched or overwritten. New installs use card-specific isc_* ids; an
+ *    existing isc_* id without the marker stops setup instead of being
+ *    replaced. Existing installs are found by alias + marker and updated in
+ *    place.
  *
  * Bug fixes (v0.4.4):
  *  - HELPER WRITES ALWAYS FAILED (Gavin, root cause of the stuck "Sync now"
@@ -117,7 +132,7 @@
  *    coexist, each with its own days/time/duration.
  *  - The card face lists schedules with plain-language summaries
  *    ("Mon, Wed, Fri at 5:30 am for 10 min"), an enable toggle each, and
- *    tap-to-expand day/time/duration editors. Rain sentence, rain delay,
+ *    tap-to-expand read-only details (edit in the card editor). Rain sentence, rain delay,
  *    skip-next and the global master switch are unchanged.
  *  - The editor leads with schedules (v0.3.1): directly under the basics a
  *    "Schedules" list is the primary call-to-action ("+ Add schedule"), each
@@ -137,7 +152,7 @@
  *    blocks contributed by every enabled schedule on that zone (each schedule
  *    writes {from: start, to: start+minutes} on its days). This is the sync
  *    mechanism — schedule definitions are the source of truth (they live in the
- *    card config, saved to the Lovelace config via WebSocket), and the helper
+ *    card config, saved by the card editor via config-changed), and the helper
  *    is a derived cache the dispatcher automation reads. The dispatcher is
  *    untouched: it starts a zone when its helper block begins and runs it for
  *    the block's own length (next_event − now), so per-schedule durations are
@@ -166,7 +181,7 @@
 
   const CARD_TAG = "irrigation-schedule-card";
   const EDITOR_TAG = "irrigation-schedule-card-editor";
-  const VERSION = "0.4.6";
+  const VERSION = "0.5.0";
 
   const MAX_ZONES = 8;
   /* Escape freeform text before it goes into innerHTML: card and schedule
@@ -704,7 +719,7 @@
         throw new Error(`${CARD_TAG}: maximum ${MAX_ZONES} zones`);
       }
       this._config = config;
-      // Working copy of schedules the face edits and persists. Back-compat: a
+      // Working copy of schedules for display. Back-compat: a
       // v0.2 config has no `schedules`; we derive one per zone once helpers load.
       this._schedules = Array.isArray(config.schedules)
         ? config.schedules.map((s) => ({ ...s }))
@@ -943,149 +958,13 @@
       };
     }
 
-    // Persist schedules into the Lovelace config so face edits survive reloads.
-    // We emit config-changed AND, when the card is not inside the GUI editor,
-    // write straight to the Lovelace storage config over WS so a plain view
-    // (no editor mounted) still saves. Both paths carry the same schedules
-    // array, so config and helpers can never silently drift.
-    _persistSchedules() {
-      const next = {
-        ...this._config,
-        schedules: this._effectiveSchedules().map((s) => this._normSchedule(s)),
-      };
-      this._config = next;
-      // Lovelace listens for this to write storage when an editor context owns
-      // the card; harmless otherwise.
-      fireEvent(this, "config-changed", { config: next });
-      this._saveLovelaceConfig(next);
-    }
-
-    // Robust persistence for face edits: locate this card in the active
-    // Lovelace storage dashboard and rewrite just this card's config via the
-    // config/save WebSocket, so edits made on the card face (no editor open)
-    // are not lost on refresh. Best-effort and idempotent.
-    async _saveLovelaceConfig(cardConfig) {
-      const hass = this._hass;
-      if (!hass?.callWS) return;
-      try {
-        const urlPath = this._dashboardUrlPath();
-        const req = { type: "lovelace/config", force: false };
-        if (urlPath) req.url_path = urlPath;
-        const lovelace = await hass.callWS(req);
-        if (!lovelace || !Array.isArray(lovelace.views)) return;
-        let changed = false;
-        const matches = (card) =>
-          card &&
-          (card.type === `custom:${CARD_TAG}` || card.type === CARD_TAG) &&
-          (card.title || "") === (cardConfig.title || "") &&
-          this._sameZones(card.zones, cardConfig.zones);
-        const walk = (cards) => {
-          if (!Array.isArray(cards)) return;
-          for (let i = 0; i < cards.length; i++) {
-            const card = cards[i];
-            if (matches(card)) {
-              cards[i] = { ...card, schedules: cardConfig.schedules };
-              changed = true;
-            } else if (card && Array.isArray(card.cards)) {
-              walk(card.cards);
-            }
-          }
-        };
-        (lovelace.views || []).forEach((v) => {
-          walk(v.cards);
-          (v.sections || []).forEach((sec) => walk(sec.cards));
-        });
-        if (!changed) return;
-        const save = { type: "lovelace/config/save", config: lovelace };
-        if (urlPath) save.url_path = urlPath;
-        await hass.callWS(save);
-      } catch (e) {
-        // Non-admin users or YAML-mode dashboards can't save this way; the
-        // config-changed event still covers the editor path.
-        console.debug(`${CARD_TAG}: lovelace save skipped`, e);
-      }
-    }
-
-    _dashboardUrlPath() {
-      // Derive the dashboard url_path from the current location, e.g.
-      // /dashboard-mobile/irrigation -> "dashboard-mobile". "lovelace" (the
-      // default dashboard) is passed as undefined per the WS API.
-      const seg = (location.pathname || "").split("/").filter(Boolean);
-      const first = seg[0];
-      if (!first || first === "lovelace") return undefined;
-      return first;
-    }
-
-    _sameZones(a, b) {
-      const ea = (a || []).map((z) => z.entity).join(",");
-      const eb = (b || []).map((z) => z.entity).join(",");
-      return ea === eb;
-    }
-
+    // Schedule definitions are edited only in the card editor, where Lovelace
+    // persists them through config-changed. The card face never writes the
+    // dashboard config (pre-0.5.0 it rewrote the whole dashboard over WS on
+    // every face edit, which could clobber concurrent dashboard changes).
     _sched(id) {
       const s = this._effectiveSchedules().find((x) => x.id === id);
       return s ? this._normSchedule(s) : null;
-    }
-
-    _updateSchedule(id, patch) {
-      const list = this._effectiveSchedules();
-      const i = list.findIndex((x) => x.id === id);
-      if (i < 0) return null;
-      const merged = this._normSchedule({ ...list[i], ...patch });
-      list[i] = merged;
-      this._schedules = list;
-      this._stateKey = "";
-      this._render();
-      this._persistSchedules();
-      return merged;
-    }
-
-    _toggleDay(id, idx) {
-      const s = this._sched(id);
-      if (!s) return;
-      const set = new Set(s.days);
-      set.has(idx) ? set.delete(idx) : set.add(idx);
-      const patch = { days: [...set].sort((a, b) => a - b) };
-      if (s.custom) {
-        // Editing a preserved custom schedule collapses it to the simple model.
-        patch.custom = false;
-        patch.customSummary = "";
-      }
-      this._updateSchedule(id, patch);
-      this._syncAllZones();
-    }
-
-    _setStart(id, start) {
-      const s = this._sched(id);
-      if (!s) return;
-      const patch = { start };
-      if (s.custom) {
-        patch.custom = false;
-        patch.customSummary = "";
-      }
-      this._updateSchedule(id, patch);
-      this._syncAllZones();
-    }
-
-    _bumpMinutes(id, delta) {
-      const s = this._sched(id);
-      if (!s) return;
-      const step = s.minutes >= 10 ? 5 : 1;
-      const minutes = Math.min(180, Math.max(1, s.minutes + delta * step));
-      const patch = { minutes };
-      if (s.custom) {
-        patch.custom = false;
-        patch.customSummary = "";
-      }
-      this._updateSchedule(id, patch);
-      this._syncAllZones();
-    }
-
-    _toggleScheduleEnabled(id) {
-      const s = this._sched(id);
-      if (!s) return;
-      this._updateSchedule(id, { enabled: !s.enabled });
-      this._syncAllZones();
     }
 
     _toggleExpand(id) {
@@ -1686,15 +1565,15 @@
       const expanded = this._expanded.has(id);
       const summary = this._scheduleSummary(i);
 
-      const headCtl = `<button class="stoggle ${i.enabled ? "on" : ""}" data-enable="${id}"
+      // Read-only on the card face: schedules are edited in the card editor.
+      const headCtl = `<span class="stoggle ro ${i.enabled ? "on" : ""}"
              title="${i.enabled ? "Schedule enabled" : "Schedule off"}">
              <ha-icon icon="${i.enabled ? "mdi:toggle-switch" : "mdi:toggle-switch-off-outline"}"></ha-icon>
-           </button>`;
+           </span>`;
 
       const chips = DAYS.map(
         (d, di) =>
-          `<button class="day ${s.days.includes(di) ? "on" : ""}"
-             data-id="${id}" data-day="${di}">${d.short}</button>`
+          `<span class="day ro ${s.days.includes(di) ? "on" : ""}">${d.short}</span>`
       ).join("");
 
       let body = "";
@@ -1705,7 +1584,7 @@
               s.custom
                 ? `<div class="mini-note">
                      <ha-icon icon="mdi:information-outline"></ha-icon>
-                     This schedule was set outside the card. Editing the days, time or duration below replaces it with a simple weekly one.
+                     This schedule was set outside the card. Editing it in the card editor replaces it with a simple weekly one.
                    </div>`
                 : ""
             }
@@ -1715,15 +1594,17 @@
             </div>
             <div class="days">${chips}</div>
             <div class="sctl">
-              <label class="time">
+              <span class="time">
                 <ha-icon icon="mdi:clock-outline"></ha-icon>
-                <input type="time" value="${esc(s.start)}" data-time="${id}" />
-              </label>
-              <div class="stepper">
-                <button class="step minus" data-mins="${id}" data-dir="-1">−</button>
-                <span class="mins">${s.minutes} min</span>
-                <button class="step plus" data-mins="${id}" data-dir="1">+</button>
+                <span>${esc(s.start)}</span>
+              </span>
+              <div class="stepper ro">
+                <span class="mins">${esc(s.minutes)} min</span>
               </div>
+            </div>
+            <div class="mini-note">
+              <ha-icon icon="mdi:pencil-outline"></ha-icon>
+              Change days, time, duration or on/off in the card editor.
             </div>
           </div>`;
       }
@@ -1776,33 +1657,8 @@
 
       root.querySelectorAll("[data-expand]").forEach((el) =>
         el.addEventListener("click", (ev) => {
-          if (ev.target.closest("[data-enable],[data-create]")) return;
+          if (ev.target.closest("[data-create]")) return;
           this._toggleExpand(el.dataset.expand);
-        })
-      );
-
-      root.querySelectorAll(".day").forEach((b) =>
-        b.addEventListener("click", (ev) => {
-          ev.stopPropagation();
-          this._toggleDay(b.dataset.id, Number(b.dataset.day));
-        })
-      );
-      root.querySelectorAll("[data-time]").forEach((inp) => {
-        inp.addEventListener("click", (ev) => ev.stopPropagation());
-        inp.addEventListener("change", () => {
-          if (inp.value) this._setStart(inp.dataset.time, inp.value);
-        });
-      });
-      root.querySelectorAll("[data-mins]").forEach((b) =>
-        b.addEventListener("click", (ev) => {
-          ev.stopPropagation();
-          this._bumpMinutes(b.dataset.mins, Number(b.dataset.dir));
-        })
-      );
-      root.querySelectorAll("[data-enable]").forEach((b) =>
-        b.addEventListener("click", (ev) => {
-          ev.stopPropagation();
-          this._toggleScheduleEnabled(b.dataset.enable);
         })
       );
     }
@@ -2064,6 +1920,16 @@
       min-width: 52px; text-align: center;
       font-size: 0.82rem; font-weight: 600; color: var(--primary-text-color);
     }
+
+    /* Read-only face (v0.5.0): no hover/pointer affordance on display-only
+       chips, toggle and duration. */
+    .day.ro { display: inline-flex; justify-content: center; cursor: default; }
+    .day.ro:hover { border-color: var(--divider-color); }
+    .day.ro.on:hover { border-color: var(--primary-color); }
+    .stoggle.ro { cursor: default; }
+    .stoggle.ro:hover { background: transparent; }
+    .stepper.ro { padding: 6px 8px; }
+    .time > span { color: var(--primary-text-color); font-size: 0.9rem; }
   `;
 
   /* ========================================================== EDITOR */
@@ -2705,81 +2571,78 @@
       return "Created by irrigation-schedule-card";
     }
 
-    // Find the internal config id of an existing automation that is "the same
-    // automation" as the one we're about to write — matched first by alias
-    // (exact), else by our description marker on an automation whose alias starts
-    // the same way. Returns the numeric/string id (attributes.id) or null.
-    // This is what stops the v0.4.0 bug where an existing dispatcher
-    // ("Irrigation Schedule - dispatcher", a different internal id) was ignored
-    // and a `_2` sibling created.
-    _findExistingAutomationId(desired) {
-      const hass = this._hass;
-      if (!hass?.states) return null;
-      const marker = IrrigationScheduleCard.AUTOMATION_MARKER;
-      const wantAlias = String(desired.alias || "").trim().toLowerCase();
-      let markerMatch = null;
-      for (const [entityId, st] of Object.entries(hass.states)) {
-        if (!entityId.startsWith("automation.")) continue;
-        const id = st.attributes?.id;
-        if (id == null) continue;
-        const alias =
-          st.attributes?.friendly_name != null
-            ? String(st.attributes.friendly_name).trim().toLowerCase()
-            : "";
-        // Exact alias match wins outright.
-        if (wantAlias && alias === wantAlias) return id;
-        // Otherwise remember an automation carrying our marker with a matching
-        // alias, as a fallback (alias-not-yet-loaded / renamed friendly name).
-        // We can only read the description via a config fetch, so defer that to
-        // the caller; here we just collect marker-alias candidates.
-        if (wantAlias && alias && alias === wantAlias) markerMatch = id;
-      }
-      return markerMatch;
-    }
-
-    // Fetch an automation's stored config by id (to inspect its description
-    // marker). Returns the config object or null.
+    // Fetch an automation's stored config by id. Returns the config object, or
+    // null when it doesn't exist (404). Any other error is rethrown so setup
+    // fails loudly instead of guessing.
     async _getAutomationConfig(id) {
       try {
         return await this._hass.callApi("get", `config/automation/config/${id}`);
       } catch (e) {
-        return null;
+        const status = e?.status_code ?? e?.status;
+        if (status === 404 || /404|not found/i.test(String(e?.error ?? e?.message ?? ""))) return null;
+        throw e;
       }
     }
 
-    // Idempotent automation writer. Resolves an existing automation to update in
-    // place (preserving its internal id) by alias, then by our description
-    // marker; only if neither is found does it create under the stable
-    // convention id `defaultId`. Never creates a sibling of an automation this
-    // card already owns.
-    async _upsertAutomation(defaultId, config) {
-      const hass = this._hass;
-      let targetId = this._findExistingAutomationId(config);
+    _isOwnedAutomation(cfg) {
+      return !!cfg &&
+        String(cfg.description || "").includes(this.constructor.AUTOMATION_MARKER);
+    }
 
-      // If no exact alias hit, scan automations carrying our marker whose purpose
-      // matches (same alias once its config is read). This catches the case where
-      // the friendly_name/alias in state differs from what we intend to write but
-      // the stored automation is still ours to update.
+    // Idempotent automation writer that only ever touches automations this card
+    // owns (AUTOMATION_MARKER in the description). Resolution order:
+    //  1. an automation whose alias matches AND carries the marker — updated in
+    //     place, preserving its internal id (covers pre-0.5.0 installs that used
+    //     the generic irrigation_* ids, and stops the v0.4.0 `_2` sibling bug);
+    //  2. otherwise create under the card-specific `ownedId` (isc_ prefix). If
+    //     something already lives at that id without our marker, stop and leave
+    //     it alone.
+    // A same-named automation WITHOUT the marker is the user's and is never
+    // matched or overwritten.
+    async _upsertAutomation(ownedId, config) {
+      const hass = this._hass;
+      const wantAlias = String(config.alias || "").trim().toLowerCase();
+
+      // Cheap pass: alias match from state, confirmed by marker.
+      const aliasHits = [];
+      const others = [];
+      for (const [entityId, st] of Object.entries(hass.states || {})) {
+        if (!entityId.startsWith("automation.")) continue;
+        const id = st.attributes?.id;
+        if (id == null) continue;
+        const alias = String(st.attributes?.friendly_name ?? "").trim().toLowerCase();
+        (wantAlias && alias === wantAlias ? aliasHits : others).push(id);
+      }
+      let targetId = null;
+      for (const id of aliasHits) {
+        if (this._isOwnedAutomation(await this._getAutomationConfig(id))) {
+          targetId = id;
+          break;
+        }
+      }
+      // Slow pass: friendly name differs from the stored alias (renamed entity).
       if (targetId == null) {
-        const wantAlias = String(config.alias || "").trim().toLowerCase();
-        for (const [entityId, st] of Object.entries(hass.states || {})) {
-          if (!entityId.startsWith("automation.")) continue;
-          const id = st.attributes?.id;
-          if (id == null) continue;
+        for (const id of others) {
           const cfg = await this._getAutomationConfig(id);
-          if (!cfg) continue;
-          const desc = String(cfg.description || "");
-          const alias = String(cfg.alias || "").trim().toLowerCase();
-          if (desc.includes(IrrigationScheduleCard.AUTOMATION_MARKER) && alias === wantAlias) {
+          if (this._isOwnedAutomation(cfg) &&
+              String(cfg.alias || "").trim().toLowerCase() === wantAlias) {
             targetId = id;
             break;
           }
         }
       }
 
-      const writeId = targetId != null ? targetId : defaultId;
-      // Preserve the existing internal id in the body when updating in place.
-      const body = targetId != null ? { ...config, id: String(writeId) } : config;
+      if (targetId == null) {
+        const existing = await this._getAutomationConfig(ownedId);
+        if (existing && !this._isOwnedAutomation(existing)) {
+          throw new Error(
+            `automation ${ownedId} already exists and wasn't created by this card, so it was left alone. Rename or remove it, then run setup again`
+          );
+        }
+      }
+
+      const writeId = targetId != null ? targetId : ownedId;
+      const body = { ...config, id: String(writeId) };
       await hass.callApi("post", `config/automation/config/${writeId}`, body);
       return writeId;
     }
@@ -2868,13 +2731,13 @@
           timerIds.push(z.timer);
         });
 
-        await this._upsertAutomation("irrigation_schedule_dispatcher",
+        await this._upsertAutomation("isc_dispatcher",
           this._dispatcherConfig(cfg, scheduleIds, switchMap, timerMap, enableMap));
-        await this._upsertAutomation("irrigation_schedule_rain_stop",
+        await this._upsertAutomation("isc_rain_stop",
           this._rainStopConfig(cfg, switchIds, timerIds));
-        await this._upsertAutomation("irrigation_zone_timer_finished",
+        await this._upsertAutomation("isc_zone_timer_finished",
           this._timerFinishedConfig(offZoneMap));
-        await this._upsertAutomation("irrigation_zone_external_off",
+        await this._upsertAutomation("isc_zone_external_off",
           this._externalOffConfig(offTimerMap));
 
         // 5. seed a schedule per zone if none defined yet, then persist config
