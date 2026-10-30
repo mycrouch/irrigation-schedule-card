@@ -1,8 +1,32 @@
 /**
- * Irrigation Schedule Card v0.5.0
+ * Irrigation Schedule Card v0.6.0
  * https://github.com/mycrouch/irrigation-schedule-card
  * ----------------------------------------------------------------
  * A Lovelace card for weekly irrigation scheduling with rain smarts.
+ *
+ * Changes (v0.6.0):
+ *  - CARD-FACE EDITING IS BACK (Gavin: toggles were inert on the phone and he
+ *    couldn't turn a schedule on). v0.5.0 removed face editing outright to get
+ *    rid of the unsafe dashboard save; v0.6.0 keeps that save gone and adds a
+ *    strict one. The per-schedule enable toggle, day chips, start time and
+ *    duration stepper are live again.
+ *  - card_uid identity: the editor writes a random `card_uid` into the config
+ *    when it's absent (and mints a fresh one if the dashboard holds the same
+ *    uid twice, e.g. after duplicating a card). A face save fetches the
+ *    dashboard config, finds cards of type custom:irrigation-schedule-card with
+ *    that exact card_uid anywhere in views/sections/stacks, and only when there
+ *    is EXACTLY ONE replaces that card's `schedules` key (nothing else) and
+ *    saves. Zero or several matches, or any WS failure, writes nothing, leaves
+ *    the face unchanged and shows "Couldn't save — open the card editor…".
+ *    No title/zone matching, ever. This is the card's only dashboard write.
+ *  - After a successful face save the zone helpers are regenerated and the
+ *    legacy enable booleans synced through the same regenerateHelpers routine
+ *    the editor uses (helper blocks reloaded first); failures are surfaced.
+ *  - A card without card_uid keeps the read-only face, with a note to save the
+ *    card editor once to enable on-card editing. Non-admins and the editor
+ *    preview also get the read-only face.
+ *  - Unchanged: v0.5.0 card-owned-automation rule, v0.4.5/0.4.6 escaping and
+ *    String() coercion, drift warning + Sync now, fail-safe rain, dispatcher.
  *
  * Changes (v0.5.0, HACS review):
  *  - The card face no longer writes the dashboard. Pre-0.5.0 every face edit
@@ -132,7 +156,8 @@
  *    coexist, each with its own days/time/duration.
  *  - The card face lists schedules with plain-language summaries
  *    ("Mon, Wed, Fri at 5:30 am for 10 min"), an enable toggle each, and
- *    tap-to-expand read-only details (edit in the card editor). Rain sentence, rain delay,
+ *    tap-to-expand day/time/duration controls (v0.6.0: saved by card_uid;
+ *    read-only until the card has one). Rain sentence, rain delay,
  *    skip-next and the global master switch are unchanged.
  *  - The editor leads with schedules (v0.3.1): directly under the basics a
  *    "Schedules" list is the primary call-to-action ("+ Add schedule"), each
@@ -152,7 +177,8 @@
  *    blocks contributed by every enabled schedule on that zone (each schedule
  *    writes {from: start, to: start+minutes} on its days). This is the sync
  *    mechanism — schedule definitions are the source of truth (they live in the
- *    card config, saved by the card editor via config-changed), and the helper
+ *    card config, saved by the card editor via config-changed or by the face's
+ *    strict card_uid save), and the helper
  *    is a derived cache the dispatcher automation reads. The dispatcher is
  *    untouched: it starts a zone when its helper block begins and runs it for
  *    the block's own length (next_event − now), so per-schedule durations are
@@ -181,7 +207,7 @@
 
   const CARD_TAG = "irrigation-schedule-card";
   const EDITOR_TAG = "irrigation-schedule-card-editor";
-  const VERSION = "0.5.0";
+  const VERSION = "0.6.0";
 
   const MAX_ZONES = 8;
   /* Escape freeform text before it goes into innerHTML: card and schedule
@@ -307,6 +333,63 @@
   let SCHED_SEQ = 0;
   const newScheduleId = () =>
     `s${Date.now().toString(36)}${(SCHED_SEQ++).toString(36)}`;
+
+  /* ------------------------------------------- card identity (v0.6.0) */
+  // Every card carries a random `card_uid`, written by the editor. Face edits
+  // find their own card in the dashboard config by this id — and only by this
+  // id. Title/zone heuristics are never used.
+  const UID_CARD_TYPE = `custom:${CARD_TAG}`;
+
+  const newCardUid = () => {
+    let r = "";
+    try {
+      const a = new Uint8Array(8);
+      crypto.getRandomValues(a);
+      r = Array.from(a, (b) => b.toString(36).padStart(2, "0")).join("");
+    } catch (e) {
+      r = `${Math.random().toString(36).slice(2)}${Date.now().toString(36)}`;
+    }
+    return `isc-${r.slice(0, 12)}`;
+  };
+
+  // Every card object in a Lovelace dashboard config with our type AND this
+  // exact card_uid, at any depth (views, sections, stacks, conditional/
+  // popup `card` wrappers, custom containers). Pure/testable.
+  const findCardsByUid = (lovelace, uid) => {
+    const hits = [];
+    if (!uid || typeof uid !== "string") return hits;
+    if (!lovelace || typeof lovelace !== "object" || !Array.isArray(lovelace.views)) return hits;
+    const seen = new Set();
+    const walk = (node, depth) => {
+      if (!node || typeof node !== "object" || depth > 64 || seen.has(node)) return;
+      seen.add(node);
+      if (Array.isArray(node)) {
+        node.forEach((n) => walk(n, depth + 1));
+        return;
+      }
+      if (node.type === UID_CARD_TYPE && node.card_uid === uid) hits.push(node);
+      Object.keys(node).forEach((k) => {
+        const v = node[k];
+        if (v && typeof v === "object") walk(v, depth + 1);
+      });
+    };
+    walk(lovelace.views, 0);
+    return hits;
+  };
+
+  // Apply a face edit to a fetched dashboard config, in place. Exactly one
+  // match -> replace ONLY that card's `schedules` key. Zero or several matches
+  // -> touch nothing and report the count so the caller refuses to save.
+  const applyScheduleSave = (lovelace, uid, schedules) => {
+    const hits = findCardsByUid(lovelace, uid);
+    if (hits.length !== 1) return { ok: false, count: hits.length };
+    hits[0].schedules = schedules;
+    return { ok: true, count: 1 };
+  };
+
+  // Expanded-schedule state survives Lovelace re-creating the card element
+  // after a face save (in-memory only, keyed by card_uid; never persisted).
+  const EXPANDED_BY_UID = new Map();
 
   /* ------------------------------------------- helper regeneration */
   // The single source of truth for turning a zone's ENABLED config schedules
@@ -632,6 +715,9 @@
       this._creating = new Set(); // entity ids mid-create
       this._syncingAll = false; // regeneration in flight
       this._syncError = null; // last WS regeneration failure (surfaced to user)
+      this._syncAgain = false; // a sync was requested while one was in flight
+      this._faceSaving = false; // a face edit is being written (controls locked)
+      this._faceError = null; // last face-save refusal/failure (surfaced to user)
     }
 
     static getConfigElement() {
@@ -647,6 +733,7 @@
         default_minutes: DEFAULT_MINUTES,
         zones: [],
         schedules: [],
+        card_uid: newCardUid(),
       };
 
       // Fix 4 guard: getStubConfig is meant for genuinely new cards only. Some HA
@@ -719,7 +806,12 @@
         throw new Error(`${CARD_TAG}: maximum ${MAX_ZONES} zones`);
       }
       this._config = config;
-      // Working copy of schedules for display. Back-compat: a
+      const uid = typeof config.card_uid === "string" ? config.card_uid : "";
+      if (uid) {
+        if (!EXPANDED_BY_UID.has(uid)) EXPANDED_BY_UID.set(uid, this._expanded);
+        this._expanded = EXPANDED_BY_UID.get(uid);
+      }
+      // Working copy of schedules for display and face edits. Back-compat: a
       // v0.2 config has no `schedules`; we derive one per zone once helpers load.
       this._schedules = Array.isArray(config.schedules)
         ? config.schedules.map((s) => ({ ...s }))
@@ -958,13 +1050,124 @@
       };
     }
 
-    // Schedule definitions are edited only in the card editor, where Lovelace
-    // persists them through config-changed. The card face never writes the
-    // dashboard config (pre-0.5.0 it rewrote the whole dashboard over WS on
-    // every face edit, which could clobber concurrent dashboard changes).
     _sched(id) {
       const s = this._effectiveSchedules().find((x) => x.id === id);
       return s ? this._normSchedule(s) : null;
+    }
+
+    /* ------------------------------------------------ face editing (v0.6.0) */
+    // The face edits schedules again, through ONE strict persistence path:
+    // fetch the dashboard config, find the card whose card_uid matches this
+    // card's (type + exact uid, any depth), replace only its `schedules` key
+    // and save. Zero or several matches, or any WS failure, writes nothing and
+    // shows an error strip. A card without a card_uid stays read-only — the
+    // card never guesses which dashboard card it is.
+
+    _canFaceEdit() {
+      return (
+        !!this._config &&
+        typeof this._config.card_uid === "string" &&
+        !!this._config.card_uid &&
+        this._isAdmin() &&
+        !this.preview
+      );
+    }
+
+    _dashboardUrlPath() {
+      // /dashboard-mobile/irrigation -> "dashboard-mobile"; the default
+      // dashboard ("lovelace") is addressed by omitting url_path.
+      const seg = (location.pathname || "").split("/").filter(Boolean);
+      const first = seg[0];
+      if (!first || first === "lovelace") return undefined;
+      return first;
+    }
+
+    async _saveSchedulesByUid(schedules) {
+      const hass = this._hass;
+      const uid = this._config?.card_uid;
+      if (!hass?.callWS) throw new Error("not connected to Home Assistant");
+      if (!uid) throw new Error("this card has no id yet");
+      const urlPath = this._dashboardUrlPath();
+      const req = { type: "lovelace/config", force: false };
+      if (urlPath) req.url_path = urlPath;
+      const lovelace = await hass.callWS(req);
+      if (!lovelace || !Array.isArray(lovelace.views)) {
+        throw new Error("this dashboard's config can't be edited from the card");
+      }
+      const res = applyScheduleSave(lovelace, uid, schedules);
+      if (!res.ok) {
+        throw new Error(
+          res.count === 0
+            ? "this card wasn't found on the dashboard"
+            : `${res.count} cards on this dashboard share this card's id`
+        );
+      }
+      const save = { type: "lovelace/config/save", config: lovelace };
+      if (urlPath) save.url_path = urlPath;
+      await hass.callWS(save);
+    }
+
+    // Apply one face edit: build the next schedule list, persist it via the
+    // uid path, and only on success adopt it locally and regenerate the zone
+    // helpers + legacy enable booleans (the same routine the editor uses).
+    // On failure the local state is left exactly as it was.
+    async _faceEdit(id, makePatch) {
+      if (!this._canFaceEdit() || this._faceSaving) return;
+      const list = this._effectiveSchedules().map((s) => this._normSchedule(s));
+      const i = list.findIndex((x) => x.id === id);
+      if (i < 0) return;
+      const patch = makePatch(list[i]);
+      if (!patch) return;
+      if (list[i].custom && !("enabled" in patch)) {
+        // Editing a preserved custom schedule collapses it to the simple model.
+        patch.custom = false;
+        patch.customSummary = "";
+      }
+      const next = list.slice();
+      next[i] = this._normSchedule({ ...list[i], ...patch });
+
+      this._faceSaving = true;
+      this._faceError = null;
+      this._render();
+      try {
+        await this._saveSchedulesByUid(next);
+      } catch (e) {
+        this._faceError = String(e?.message || e?.error || e || "unknown error");
+        console.error(`${CARD_TAG}: face save refused/failed`, e);
+        this._faceSaving = false;
+        this._stateKey = "";
+        this._render();
+        return;
+      }
+      this._schedules = next;
+      this._config = { ...this._config, schedules: next };
+      this._faceSaving = false;
+      await this._syncAllZones({ refresh: true });
+    }
+
+    _toggleDay(id, idx) {
+      this._faceEdit(id, (s) => {
+        const set = new Set(s.days);
+        set.has(idx) ? set.delete(idx) : set.add(idx);
+        return { days: [...set].sort((a, b) => a - b) };
+      });
+    }
+
+    _setStart(id, start) {
+      if (timeToMin(start) == null) return;
+      this._faceEdit(id, (s) => (s.start === start ? null : { start }));
+    }
+
+    _bumpMinutes(id, delta) {
+      this._faceEdit(id, (s) => {
+        const step = s.minutes >= 10 ? 5 : 1;
+        const minutes = Math.min(180, Math.max(1, s.minutes + delta * step));
+        return minutes === s.minutes ? null : { minutes };
+      });
+    }
+
+    _toggleScheduleEnabled(id) {
+      this._faceEdit(id, (s) => ({ enabled: !s.enabled }));
     }
 
     _toggleExpand(id) {
@@ -983,10 +1186,32 @@
     // derived cache. Rewriting all zones (not just the mutated one) also clears
     // stale blocks off zones that no longer have any enabled schedules. WS
     // failures are surfaced on the card face, never silently dropped.
-    async _syncAllZones() {
-      if (!this._hass || this._syncingAll) return;
+    async _syncAllZones(opts = {}) {
+      if (!this._hass) return;
+      if (this._syncingAll) {
+        // Don't drop a regeneration requested mid-flight (e.g. a second face
+        // edit) — run once more when the current one finishes.
+        this._syncAgain = true;
+        return;
+      }
       this._syncingAll = true;
       try {
+        if (opts.refresh) {
+          // Face edits reload the helper blocks first, as the editor path does,
+          // so the skip-if-in-sync check compares against the live helper.
+          try {
+            const list = await this._hass.callWS({ type: "schedule/list" });
+            const byId = {};
+            (list || []).forEach((s) => (byId[s.id] = s));
+            this._zones().forEach((z) => {
+              if (z?.schedule) this._helperBlocks[z.schedule] = byId[objectId(z.schedule)] || null;
+            });
+          } catch (e) {
+            this._syncError = String(e?.message || e?.error || e || "schedule/list failed");
+            console.error(`${CARD_TAG}: helper reload failed`, e);
+            return;
+          }
+        }
         const failures = await regenerateHelpers(
           this._hass,
           this._zones(),
@@ -1001,6 +1226,10 @@
         this._syncingAll = false;
         this._stateKey = "";
         this._render();
+      }
+      if (this._syncAgain) {
+        this._syncAgain = false;
+        await this._syncAllZones({ refresh: true });
       }
     }
 
@@ -1421,6 +1650,18 @@
           </div>`;
       }
 
+      // Face-save refusal/failure (v0.6.0): nothing was written, state unchanged.
+      const faceStrip = this._faceError
+        ? `
+          <div class="sync-strip err face-err">
+            <ha-icon icon="mdi:content-save-alert-outline"></ha-icon>
+            <span>Couldn't save — open the card editor to make this change. Nothing was changed (${esc(
+              this._faceError
+            )}).</span>
+            <button class="sync-now" id="face-err-ok">OK</button>
+          </div>`
+        : "";
+
       let statusIcon = "mdi:calendar-clock";
       let statusText;
       let statusClass = "";
@@ -1484,6 +1725,7 @@
             <span>${esc(statusText)}</span>
           </div>
 
+          ${faceStrip}
           ${syncStrip}
 
           ${
@@ -1565,16 +1807,42 @@
       const expanded = this._expanded.has(id);
       const summary = this._scheduleSummary(i);
 
-      // Read-only on the card face: schedules are edited in the card editor.
-      const headCtl = `<span class="stoggle ro ${i.enabled ? "on" : ""}"
+      // v0.6.0: live controls when this card can save itself by card_uid;
+      // otherwise the read-only face with a hint saying why.
+      const editable = this._canFaceEdit();
+      const busy = this._faceSaving ? "disabled" : "";
+      const eid = esc(id);
+
+      const headCtl = editable
+        ? `<button class="stoggle ${i.enabled ? "on" : ""}" data-enable="${eid}" ${busy}
+             title="${i.enabled ? "Schedule enabled — tap to turn off" : "Schedule off — tap to turn on"}">
+             <ha-icon icon="${i.enabled ? "mdi:toggle-switch" : "mdi:toggle-switch-off-outline"}"></ha-icon>
+           </button>`
+        : `<span class="stoggle ro ${i.enabled ? "on" : ""}"
              title="${i.enabled ? "Schedule enabled" : "Schedule off"}">
              <ha-icon icon="${i.enabled ? "mdi:toggle-switch" : "mdi:toggle-switch-off-outline"}"></ha-icon>
            </span>`;
 
-      const chips = DAYS.map(
-        (d, di) =>
-          `<span class="day ro ${s.days.includes(di) ? "on" : ""}">${d.short}</span>`
+      const chips = DAYS.map((d, di) =>
+        editable
+          ? `<button class="day ${s.days.includes(di) ? "on" : ""}" data-id="${eid}" data-day="${di}" ${busy}
+               title="${d.label}">${d.short}</button>`
+          : `<span class="day ro ${s.days.includes(di) ? "on" : ""}">${d.short}</span>`
       ).join("");
+
+      let readOnlyNote = "";
+      if (!editable) {
+        let why = "";
+        if (!this._config?.card_uid)
+          why = `<br />(save the card editor once to enable on-card editing)`;
+        else if (!this._isAdmin() && !this.preview)
+          why = `<br />(only an admin can change schedules)`;
+        readOnlyNote = `
+            <div class="mini-note">
+              <ha-icon icon="mdi:pencil-outline"></ha-icon>
+              <span>Change days, time, duration or on/off in the card editor.${why}</span>
+            </div>`;
+      }
 
       let body = "";
       if (expanded) {
@@ -1584,7 +1852,7 @@
               s.custom
                 ? `<div class="mini-note">
                      <ha-icon icon="mdi:information-outline"></ha-icon>
-                     This schedule was set outside the card. Editing it in the card editor replaces it with a simple weekly one.
+                     This schedule was set outside the card. Editing the days, time or duration replaces it with a simple weekly one.
                    </div>`
                 : ""
             }
@@ -1594,24 +1862,33 @@
             </div>
             <div class="days">${chips}</div>
             <div class="sctl">
-              <span class="time">
-                <ha-icon icon="mdi:clock-outline"></ha-icon>
-                <span>${esc(s.start)}</span>
-              </span>
-              <div class="stepper ro">
-                <span class="mins">${esc(s.minutes)} min</span>
-              </div>
+              ${
+                editable
+                  ? `<label class="time">
+                       <ha-icon icon="mdi:clock-outline"></ha-icon>
+                       <input type="time" value="${esc(s.start)}" data-time="${eid}" ${busy} />
+                     </label>
+                     <div class="stepper">
+                       <button class="step minus" data-mins="${eid}" data-dir="-1" ${busy} title="Shorter">−</button>
+                       <span class="mins">${esc(s.minutes)} min</span>
+                       <button class="step plus" data-mins="${eid}" data-dir="1" ${busy} title="Longer">+</button>
+                     </div>`
+                  : `<span class="time">
+                       <ha-icon icon="mdi:clock-outline"></ha-icon>
+                       <span>${esc(s.start)}</span>
+                     </span>
+                     <div class="stepper ro">
+                       <span class="mins">${esc(s.minutes)} min</span>
+                     </div>`
+              }
             </div>
-            <div class="mini-note">
-              <ha-icon icon="mdi:pencil-outline"></ha-icon>
-              Change days, time, duration or on/off in the card editor.
-            </div>
+            ${readOnlyNote}
           </div>`;
       }
 
       return `
-        <div class="sched ${i.running ? "running" : ""} ${i.enabled ? "" : "disabled"} ${expanded ? "expanded" : ""}">
-          <div class="shead" data-expand="${id}">
+        <div class="sched ${i.running ? "running" : ""} ${i.enabled ? "" : "disabled"} ${expanded ? "expanded" : ""} ${this._faceSaving ? "saving" : ""}">
+          <div class="shead" data-expand="${eid}">
             <div class="icon-wrap ${i.running ? "active" : ""}">
               <ha-icon icon="${esc(i.icon)}"></ha-icon>
             </div>
@@ -1655,14 +1932,50 @@
         })
       );
 
+      root.getElementById("face-err-ok")?.addEventListener("click", (ev) => {
+        ev.stopPropagation();
+        this._faceError = null;
+        this._render();
+      });
+
       root.querySelectorAll("[data-expand]").forEach((el) =>
         el.addEventListener("click", (ev) => {
-          if (ev.target.closest("[data-create]")) return;
+          if (ev.target.closest("[data-enable],[data-create]")) return;
           this._toggleExpand(el.dataset.expand);
+        })
+      );
+
+      // v0.6.0 face controls (rendered only when _canFaceEdit()).
+      root.querySelectorAll("button.day[data-day]").forEach((b) =>
+        b.addEventListener("click", (ev) => {
+          ev.stopPropagation();
+          this._toggleDay(b.dataset.id, Number(b.dataset.day));
+        })
+      );
+      root.querySelectorAll("[data-time]").forEach((inp) => {
+        inp.addEventListener("click", (ev) => ev.stopPropagation());
+        inp.addEventListener("change", () => {
+          if (inp.value) this._setStart(inp.dataset.time, inp.value);
+        });
+      });
+      root.querySelectorAll("[data-mins]").forEach((b) =>
+        b.addEventListener("click", (ev) => {
+          ev.stopPropagation();
+          this._bumpMinutes(b.dataset.mins, Number(b.dataset.dir));
+        })
+      );
+      root.querySelectorAll("[data-enable]").forEach((b) =>
+        b.addEventListener("click", (ev) => {
+          ev.stopPropagation();
+          this._toggleScheduleEnabled(b.dataset.enable);
         })
       );
     }
   }
+
+  // Pure uid matcher exposed for tests (no side effects).
+  IrrigationScheduleCard.findCardsByUid = findCardsByUid;
+  IrrigationScheduleCard.applyScheduleSave = applyScheduleSave;
 
   IrrigationScheduleCard.styles = `
     :host { display: block; }
@@ -1930,6 +2243,11 @@
     .stoggle.ro:hover { background: transparent; }
     .stepper.ro { padding: 6px 8px; }
     .time > span { color: var(--primary-text-color); font-size: 0.9rem; }
+
+    /* Face editing (v0.6.0): controls lock while a save is in flight. */
+    .sched.saving { opacity: 0.7; }
+    .day:disabled, .stoggle:disabled, .step:disabled, .time input:disabled { cursor: progress; }
+    .mini-note span { min-width: 0; }
   `;
 
   /* ========================================================== EDITOR */
@@ -1978,6 +2296,16 @@
       };
       this._config.zones = [...(this._config.zones || [])];
       this._config.schedules = [...(this._config.schedules || [])];
+      // v0.6.0: give the card its identity. A config without a card_uid gets
+      // one (stable for this editor instance) and the editor emits it at once,
+      // so the next Save stores it and the card face can save itself by id.
+      if (typeof this._config.card_uid !== "string" || !this._config.card_uid) {
+        this._genUid = this._genUid || newCardUid();
+        this._config.card_uid = this._genUid;
+        setTimeout(() => this._fire(), 0);
+      } else {
+        this._maybeHealDuplicateUid();
+      }
       const structureChanged =
         !this._rendered ||
         !prev ||
@@ -2005,6 +2333,7 @@
     set hass(hass) {
       const firstHass = !this._hass;
       this._hass = hass;
+      if (firstHass && this._config?.card_uid) this._maybeHealDuplicateUid();
       this.shadowRoot?.querySelectorAll("ha-form").forEach((f) => (f.hass = hass));
       if (!this._rendered) {
         this._render();
@@ -2349,7 +2678,39 @@
     };
 
     _fire() {
+      if (typeof this._config.card_uid !== "string" || !this._config.card_uid) {
+        this._genUid = this._genUid || newCardUid();
+        this._config = { ...this._config, card_uid: this._genUid };
+      }
       fireEvent(this, "config-changed", { config: this._config });
+    }
+
+    // A duplicated card carries a copy of the original's card_uid, which makes
+    // the face refuse to save (by design). When the editor opens on a uid that
+    // the dashboard holds more than once, mint a fresh one so Save fixes it.
+    // Read-only lookup; never writes the dashboard.
+    async _maybeHealDuplicateUid() {
+      const uid = this._config?.card_uid;
+      if (!uid || this._uidChecked === uid || !this._hass?.callWS) return;
+      this._uidChecked = uid;
+      try {
+        const seg = (location.pathname || "").split("/").filter(Boolean);
+        const req = { type: "lovelace/config", force: false };
+        if (seg[0] && seg[0] !== "lovelace") req.url_path = seg[0];
+        const lovelace = await this._hass.callWS(req);
+        if (findCardsByUid(lovelace, uid).length > 1 && this._config.card_uid === uid) {
+          this._genUid = newCardUid();
+          this._uidChecked = this._genUid;
+          this._config = { ...this._config, card_uid: this._genUid };
+          this._fire();
+          this._showRegenStatus(
+            "This card shared its id with another card (it was probably duplicated). It has a new id now — save to enable on-card editing.",
+            false
+          );
+        }
+      } catch (e) {
+        /* read-only check; nothing to surface */
+      }
     }
 
     // v0.4.2: after ANY schedule mutation in the editor, regenerate the zone
